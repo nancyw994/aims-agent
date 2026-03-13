@@ -7,6 +7,12 @@ venv/
 .venv/
 env/
 
+# Logs (e.g. dependency install errors)
+logs/
+
+# Outputs (Week 4 plots)
+results/
+
 # Python
 __pycache__/
 *.py[cod]

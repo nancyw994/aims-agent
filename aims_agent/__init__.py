@@ -23,6 +23,15 @@ from aims_agent.model_selector import (
 from aims_agent.dependency_manager import ensure_package_installed, INSTALL_LOG
 from aims_agent.model_trainer import ModelTrainer
 from aims_agent.results_analyzer import compute_metrics, plot_results, interpret_with_llm
+from aims_agent.code_writer import (
+    build_code_generation_prompt,
+    extract_python_code,
+    validate_python_syntax,
+    save_generated_code,
+    generate_code_file,
+    load_generated_module,
+    execute_generated_component,
+)
 
 __all__ = [
     "Agent",
@@ -47,5 +56,12 @@ __all__ = [
     "compute_metrics",
     "plot_results",
     "interpret_with_llm",
+    "build_code_generation_prompt",
+    "extract_python_code",
+    "validate_python_syntax",
+    "save_generated_code",
+    "generate_code_file",
+    "load_generated_module",
+    "execute_generated_component",
 ]
 

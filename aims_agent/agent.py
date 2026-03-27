@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, List, Literal, Mapping
 
+from aims_agent.code_writer import execute_generated_component, generate_code_file
 from aims_agent.data_interface import DataInterface, DatasetBundle, get_metadata
 from aims_agent.dependency_manager import ensure_package_installed
 from aims_agent.distribution import analyze_distribution, plot_distribution
@@ -18,8 +20,11 @@ class PipelineResult:
 
     steps: List[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    background_knowledge: str = ""
     distribution_summary: str = ""
     distribution_plot_path: str = ""
+    generated_code_path: str = ""
+    generated_code_note: str = ""
     suggestion: ModelSuggestion | None = None
     metrics: dict[str, float] = field(default_factory=dict)
     plot_path: str = ""
@@ -46,12 +51,6 @@ class Agent:
             raise RuntimeError(f"LLM call failed: {e}") from e
 
     def retrieve_data(self, interface: DataInterface, config: Mapping[str, Any]) -> DatasetBundle:
-        """
-        Entry point for the DATA INTERFACE step.
-
-        Downstream code should call this method instead of interacting
-        with concrete loaders directly.
-        """
         return interface.load_dataset(config)
 
     def select_model_and_ensure_deps(
@@ -64,9 +63,6 @@ class Agent:
     ) -> tuple[ModelSuggestion, bool]:
         """
         Query the LLM for a model suggestion, then ensure its package is installed.
-
-        Returns (suggestion, installed_ok). If the package was missing and install
-        failed, installed_ok is False; the error is logged by dependency_manager.
         """
         suggestion = suggest_model(
             self,
@@ -83,6 +79,7 @@ class Agent:
         interface: DataInterface,
         data_config: Mapping[str, Any],
         motivation: str,
+        background_knowledge: str | None = None,
         *,
         task_type: Literal["regression", "classification"] = "regression",
         use_hyperparameter_tuning: bool = True,
@@ -92,6 +89,9 @@ class Agent:
         choose_model_fn: Any | None = None,
         use_llm: bool = True,
         fixed_model: str | None = None,
+        use_custom_codegen: bool = False,
+        custom_code_request: str | None = None,
+        generated_code_dir: str = "generated_code",
     ) -> PipelineResult:
         """
         Execute the full ML pipeline based on the LLM plan.
@@ -122,6 +122,7 @@ class Agent:
             bundle = self.retrieve_data(interface, data_config)
             metadata = get_metadata(bundle)
             result.metadata = metadata
+            result.background_knowledge = background_knowledge or ""
 
             # Step 1b: Distribution analysis
             dist_stats = analyze_distribution(
@@ -145,14 +146,23 @@ class Agent:
             if use_llm:
                 from aims_agent.planning import plan_workflow_steps
 
-                plan_actions = plan_workflow_steps(self, motivation, dataset_metadata=metadata)
+                plan_actions = plan_workflow_steps(
+                    self,
+                    motivation,
+                    dataset_metadata=metadata,
+                    background_knowledge=background_knowledge,
+                    include_codegen=use_custom_codegen,
+                )
             else:
                 plan_actions = [
                     {"action": "select_model", "description": "Select ML model for the task"},
+                    {"action": "codegen", "description": "Generate and execute a custom code component"},
                     {"action": "train", "description": "Split data, train model (with optional hyperparameter tuning)"},
                     {"action": "evaluate", "description": "Evaluate on test set and generate plots"},
                     {"action": "interpret", "description": "Summarize metrics and interpretation"},
                 ]
+                if not use_custom_codegen:
+                    plan_actions = [p for p in plan_actions if p["action"] != "codegen"]
             result.steps = [p.get("description", p.get("action", "")) for p in plan_actions]
 
             # Step 3: Execute plan
@@ -177,6 +187,12 @@ class Agent:
                         extra_ctx = result.distribution_summary
                         if metadata.get("description"):
                             extra_ctx = f"{metadata['description']}\n\n{extra_ctx}"
+                        if background_knowledge:
+                            extra_ctx = (
+                                f"{extra_ctx}\n\n"
+                                "User-provided background knowledge / constraints:\n"
+                                f"{background_knowledge.strip()}"
+                            )
                         suggestions = suggest_models(
                             self,
                             features=metadata["features"],
@@ -211,6 +227,40 @@ class Agent:
                             return result
                     continue
 
+                # codegen
+                if action == "codegen":
+                    if not use_custom_codegen:
+                        continue
+                    if not use_llm:
+                        continue
+                    code_request = (
+                        custom_code_request
+                        or "Generate a robust custom preprocessing component for this materials dataset."
+                    )
+                    module_name = f"custom_component_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    result.generated_code_path = generate_code_file(
+                        self,
+                        request=code_request,
+                        dataset_metadata=metadata,
+                        background_knowledge=background_knowledge,
+                        task_type=task_type,
+                        output_dir=generated_code_dir,
+                        module_name=module_name,
+                    )
+                    cg_result = execute_generated_component(
+                        result.generated_code_path,
+                        df=bundle.df,
+                        features=list(metadata["features"]),
+                        target=metadata["target"],
+                        task_type=task_type,
+                    )
+                    if "features" in cg_result and isinstance(cg_result["features"], list):
+                        valid_features = [f for f in cg_result["features"] if f in bundle.df.columns]
+                        if valid_features:
+                            metadata["features"] = valid_features
+                    result.generated_code_note = str(cg_result.get("note", "")).strip()
+                    continue
+
                 # train
                 if action == "train":
                     if skip_training:
@@ -225,7 +275,7 @@ class Agent:
                             fallback.package_name
                         ):
                             print(
-                                f"[Model] 加载 {suggestion.model_name} 失败 ({e})，改用 {fallback.model_name}"
+                                f"[Model] loads {suggestion.model_name} failed ({e})then changes to {fallback.model_name}"
                             )
                             suggestion = fallback
                             result.suggestion = suggestion
@@ -258,14 +308,18 @@ class Agent:
                         if use_llm:
                             try:
                                 result.interpretation = interpret_with_llm(
-                                    self, result.metrics, suggestion.model_name, task_type=task_type
+                                    self,
+                                    result.metrics,
+                                    suggestion.model_name,
+                                    task_type=task_type,
+                                    background_knowledge=background_knowledge,
                                 )
                             except Exception as e:
                                 result.interpretation = interpret_from_metrics(
                                     result.metrics, suggestion.model_name, task_type=task_type
                                 )
                                 result.interpretation = (
-                                    f"[LLM 解释失败 ({e})，使用本地摘要]\n\n" + result.interpretation
+                                    f"[LLM interprets failed ({e})，use local summary]\n\n" + result.interpretation
                                 )
                         else:
                             result.interpretation = interpret_from_metrics(
@@ -276,6 +330,6 @@ class Agent:
         except Exception as e:
             result.success = False
             result.error = str(e)
-            raise
+            return result
 
         return result

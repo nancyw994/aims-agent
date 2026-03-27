@@ -43,7 +43,7 @@ def LMF_LLM(prompt: str) -> str:
             last_error = getattr(completion, "error", None)
             if attempt < MAX_RETRIES - 1:
                 wait = RETRY_DELAY * (attempt + 1)
-                print(f"[LLM] 504/502/503，{wait}s 后重试 ({attempt + 1}/{MAX_RETRIES})...")
+                print(f"[LLM] 504/502/503，after {wait}s retry ({attempt + 1}/{MAX_RETRIES})...")
                 time.sleep(wait)
                 continue
         msg = "OpenRouter returned no choices (empty or rate-limited?)."

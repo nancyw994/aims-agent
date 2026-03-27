@@ -1,8 +1,5 @@
 """
 Distribution analysis — summarize data distributions for LLM-based model recommendation.
-
-Computes target and feature statistics (class balance, skewness, etc.) and formats
-a summary for the LLM to use when recommending which ML model to use.
 """
 
 from __future__ import annotations

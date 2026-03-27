@@ -117,9 +117,13 @@ def list_all_models(task_type: str = "all") -> List[str]:
 
 def get_model_suggestion(model_name: str, task_type: str) -> ModelSuggestion | None:
     """
-    Get a ModelSuggestion by model name (no LLM). Returns None if unknown.
+    Get a ModelSuggestion by model name (no LLM). Returns None if unknown or mismatched task type.
     """
     if model_name not in MODEL_IMPORT_MAP:
+        return None
+    if task_type == "regression" and model_name not in REGRESSION_MODELS:
+        return None
+    if task_type == "classification" and model_name not in CLASSIFICATION_MODELS:
         return None
     module_path, class_name = MODEL_IMPORT_MAP[model_name]
     pkg = "scikit-learn"
@@ -167,7 +171,11 @@ Each object MUST have all four fields:
   - model_name: the class name (e.g. RandomForestClassifier)
   - package: the pip install name (e.g. scikit-learn for sklearn, xgboost, lightgbm, catboost)
   - import_path: CRITICAL — full Python import path (e.g. sklearn.ensemble.RandomForestClassifier). Without import_path we cannot load the model. Always provide it.
-  - reason: one sentence why this model fits
+  - reason: 1-2 sentences with professional reasoning based on task type and data characteristics
+
+Task-type constraint:
+- If Task type is regression, only suggest regression models.
+- If Task type is classification, only suggest classification models.
 
 Example:
 [
@@ -178,12 +186,27 @@ Example:
 
     response = agent.call_llm(prompt)
     suggestions = _parse_responses(response)
+    suggestions = _filter_suggestions_for_task(suggestions, task_hint)
 
     if not suggestions:
         print("[ModelSelector] Could not parse LLM response, using default model.")
-        return [DEFAULT_SUGGESTION]
+        return [get_default_suggestion(task_hint)]
 
     return suggestions
+
+
+def _filter_suggestions_for_task(
+    suggestions: List[ModelSuggestion],
+    task_type: str,
+) -> List[ModelSuggestion]:
+    """Filter out model suggestions that do not match task type."""
+    if task_type not in {"regression", "classification"}:
+        return suggestions
+    allowed = set(REGRESSION_MODELS if task_type == "regression" else CLASSIFICATION_MODELS)
+    filtered = [s for s in suggestions if s.model_name in allowed]
+    if len(filtered) < len(suggestions):
+        print(f"[ModelSelector] Removed {len(suggestions) - len(filtered)} task-mismatched model suggestion(s).")
+    return filtered
 
 
 def suggest_model(

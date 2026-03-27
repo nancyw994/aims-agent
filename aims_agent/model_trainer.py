@@ -8,6 +8,7 @@ Supports both regression and classification tasks.
 
 from __future__ import annotations
 
+import re
 from typing import Any, List, Literal
 
 import numpy as np
@@ -30,6 +31,35 @@ DEFAULT_REGRESSION_GRIDS: dict[str, dict[str, List[Any]]] = {
     "Lasso": {"alpha": [0.001, 0.01, 0.1, 1.0]},
     "SVR": {"C": [0.1, 1.0, 10.0], "kernel": ["rbf", "linear"]},
 }
+
+def _tree_safe_feature_columns(features: List[str]) -> tuple[List[str], dict[str, str]]:
+    """
+    LightGBM (and some tree backends) reject column names with JSON-special chars
+    like []{}'",: — common in materials datasets ("Yield Strength (MPa)", "O (wt.,%)").
+    Returns (safe_names_in_order, mapping original_name -> safe_name).
+    """
+    safe_names: List[str] = []
+    orig_to_safe: dict[str, str] = {}
+    used: set[str] = set()
+    for i, orig in enumerate(features):
+        s = str(orig)
+        for ch in '[]{}"\',:':
+            s = s.replace(ch, "_")
+        s = re.sub(r"\s+", "_", s)
+        s = re.sub(r"[^A-Za-z0-9_]+", "_", s)
+        s = s.strip("_") or f"f_{i}"
+        if s[0].isdigit():
+            s = "f_" + s
+        base = s
+        n = 0
+        while s in used:
+            n += 1
+            s = f"{base}__{n}"
+        used.add(s)
+        safe_names.append(s)
+        orig_to_safe[orig] = s
+    return safe_names, orig_to_safe
+
 
 DEFAULT_CLASSIFICATION_GRIDS: dict[str, dict[str, List[Any]]] = {
     "RandomForestClassifier": {
@@ -76,6 +106,7 @@ class ModelTrainer:
         self.X_test = None
         self.y_train = None
         self.y_test = None
+        self._feature_rename_map: dict[str, str] = {}
 
     def _get_scoring(self) -> str:
         """Return the scoring metric for cross-validation."""
@@ -106,7 +137,18 @@ class ModelTrainer:
         random_state: int = 42,
     ) -> None:
         """Split into train and test sets."""
-        X = df[features]
+        n_samples = len(df)
+        if n_samples < 2:
+            raise ValueError(
+                "Dataset has fewer than 2 usable rows after preprocessing. "
+                f"n_samples={n_samples}. "
+                "Please choose a target/features with fewer missing values, disable aggressive row dropping, "
+                "or provide a larger/cleaner dataset."
+            )
+
+        X = df[features].copy()
+        safe_cols, self._feature_rename_map = _tree_safe_feature_columns(features)
+        X.columns = safe_cols
         y = df[target]
         self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
             X, y, test_size=test_size, random_state=random_state
@@ -116,15 +158,16 @@ class ModelTrainer:
         """Train the model. If hyperparams available, use GridSearchCV or RandomizedSearchCV."""
         param_grid = self._get_param_grid()
         scoring = self._get_scoring()
+        cv_folds = min(5, len(self.y_train))
 
-        if param_grid:
+        if param_grid and cv_folds >= 2:
             base = self.model_class()
             if self.use_randomized_search:
                 search = RandomizedSearchCV(
                     base,
                     param_grid,
                     n_iter=min(self.n_iter, self._count_combinations(param_grid)),
-                    cv=5,
+                    cv=cv_folds,
                     scoring=scoring,
                     n_jobs=-1,
                     random_state=42,
@@ -133,7 +176,7 @@ class ModelTrainer:
                 search = GridSearchCV(
                     base,
                     param_grid,
-                    cv=5,
+                    cv=cv_folds,
                     scoring=scoring,
                     n_jobs=-1,
                 )

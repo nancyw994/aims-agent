@@ -1,5 +1,5 @@
 """
-Week 4: Result analysis — metrics, plots, and LLM interpretation.
+Result analysis — metrics, plots, and LLM interpretation.
 
 Computes regression metrics (R2, MSE, RMSE, MAE) or classification metrics
 (accuracy, precision, recall, F1). Generates predicted vs actual / residuals
@@ -150,6 +150,7 @@ def interpret_with_llm(
     metrics: dict[str, float],
     model_name: str,
     task_type: Literal["regression", "classification"] = "regression",
+    background_knowledge: str | None = None,
 ) -> str:
     """Ask the LLM to interpret the metrics in 2–3 short paragraphs."""
     task_desc = "classification" if task_type == "classification" else "regression"
@@ -163,6 +164,13 @@ In 2–3 short paragraphs:
 1. How good is this performance (good / moderate / poor)?
 2. What do these metrics mean for materials property prediction?
 3. One concrete improvement suggestion."""
+
+    if background_knowledge:
+        prompt += (
+            "\n\nUser-provided background knowledge / constraints:\n"
+            f"{background_knowledge.strip()}\n\n"
+            "Use this context explicitly when judging performance and suggesting improvements."
+        )
 
     return agent.call_llm(prompt)
 

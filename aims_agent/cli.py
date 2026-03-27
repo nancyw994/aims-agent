@@ -5,7 +5,60 @@ import sys
 from aims_agent.agent import Agent
 from aims_agent.synthetic_loader import SyntheticDataLoader
 from aims_agent.csv_loader import CSVDataLoader
+from aims_agent.data_interface import get_metadata
 from aims_agent.model_selector import suggest_models, ModelSuggestion, list_all_models, get_model_suggestion
+from aims_agent.task_type_suggest import _heuristic_task_type, suggest_task_type
+
+
+def _resolve_task_type(
+    agent: Agent,
+    loader,
+    data_config: dict,
+    motivation: str,
+    background_knowledge: str | None,
+    task_type_arg: str,
+    *,
+    use_llm: bool,
+) -> str:
+    """
+    If task_type_arg is 'auto', load data once, get LLM (or heuristic) suggestion, then let user confirm or override.
+    Otherwise return task_type_arg unchanged.
+    """
+    if task_type_arg != "auto":
+        return task_type_arg
+
+    bundle = loader.load_dataset(data_config)
+    if use_llm:
+        tt, reason = suggest_task_type(agent, bundle, motivation, background_knowledge)
+        print(f"\n── Task type (auto) ────────────────────────────────────────")
+        print(f"LLM suggests: {tt}")
+        print(f"Reason: {reason}")
+    else:
+        meta = get_metadata(bundle)
+        tt, reason = _heuristic_task_type(bundle.df, meta["target"])
+        print(f"\n── Task type (auto, --no-llm) ──────────────────────────────")
+        print(f"Heuristic: {tt}")
+        print(f"Reason: {reason}")
+
+    if not sys.stdin.isatty():
+        print("  (non-interactive: using suggestion above)")
+        return tt
+
+    print("\nConfirm task type: Enter = accept | 1 = regression | 2 = classification")
+    try:
+        choice = input("> ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(f"\nUsing suggested: {tt}")
+        return tt
+    if not choice:
+        return tt
+    if choice in ("1", "r", "reg", "regression"):
+        print("Using: regression")
+        return "regression"
+    if choice in ("2", "c", "clf", "classification"):
+        print("Using: classification")
+        return "classification"
+    return tt
 
 
 def _interactive_choose_model(
@@ -17,11 +70,15 @@ def _interactive_choose_model(
     """
     Show numbered model suggestions. User can:
     - Enter 1..N to choose one
+    - Enter an explicit model name (e.g. RandomForestRegressor) to use directly
     - Type more requirements (e.g. prefer interpretability) to get new suggestions
     - Press Enter to use the first suggestion
     """
+    valid_models = set(list_all_models(task_type))
+    lower_to_model = {m.lower(): m for m in valid_models}
+
     while True:
-        print("\nRecommended models:")
+        print(f"\nRecommended models (task_type={task_type}):")
         for i, s in enumerate(suggestions, 1):
             print(f"  {i}. {s.model_name} ({s.package_name}) — {s.reason}")
 
@@ -30,7 +87,8 @@ def _interactive_choose_model(
             return suggestions[0]
 
         prompt_msg = (
-            "Enter number 1–%d to choose, type more requirements for new suggestions, or Enter to use the first: "
+            "Enter number 1–%d to choose, enter model name to force one, "
+            "type more requirements for new suggestions, or Enter to use the first: "
             % len(suggestions)
         )
         try:
@@ -47,6 +105,15 @@ def _interactive_choose_model(
             if 1 <= idx <= len(suggestions):
                 return suggestions[idx - 1]
             print("Invalid number. Try again.")
+            continue
+
+        forced_name = lower_to_model.get(choice.lower())
+        if forced_name:
+            forced = get_model_suggestion(forced_name, task_type)
+            if forced:
+                print(f"Using user-selected model: {forced.model_name}")
+                return forced
+            print(f"Model '{forced_name}' is not valid for task_type='{task_type}'.")
             continue
 
         # User provided more context; re-ask LLM
@@ -122,6 +189,23 @@ Examples:
         metavar="NAME_OR_INDEX",
         help="Excel sheet name or 0-based index (default: 0). Ignored for CSV.",
     )
+    data_grp.add_argument(
+        "--header-row",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Explicit Excel header row index (0-based). If not set, use smart header detection.",
+    )
+    data_grp.add_argument(
+        "--keep-na",
+        action="store_true",
+        help="Do not drop rows with missing feature values; still drops rows with missing target.",
+    )
+    data_grp.add_argument(
+        "--impute-missing",
+        action="store_true",
+        help="When used with --keep-na, impute missing feature values (numeric: median, categorical: mode).",
+    )
 
     # Task
     task_grp = p.add_argument_group("Task")
@@ -131,10 +215,23 @@ Examples:
         help="User's research goal in natural language. Required unless --list-models.",
     )
     task_grp.add_argument(
+        "--background-knowledge",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "Optional research abstract, domain context, constraints, prior findings, or hypotheses. "
+            "The AI uses this when planning, model selection, and result interpretation."
+        ),
+    )
+    task_grp.add_argument(
         "--task-type",
-        choices=["regression", "classification"],
+        choices=["regression", "classification", "auto"],
         default="regression",
-        help="ML task type (default: regression).",
+        help=(
+            "ML task type (default: regression). "
+            "Use 'auto' to load data, get an LLM suggestion from motivation + target + background "
+            "(or heuristic with --no-llm), then confirm or override interactively before the rest of the pipeline."
+        ),
     )
 
     # Synthetic data options
@@ -177,6 +274,25 @@ Examples:
         action="store_true",
         help="List all supported ML models and exit.",
     )
+    train_grp.add_argument(
+        "--use-custom-codegen",
+        action="store_true",
+        help="Enable Week-5 custom code generation and execution step.",
+    )
+    train_grp.add_argument(
+        "--custom-code-request",
+        type=str,
+        default=None,
+        metavar="TEXT",
+        help="Specific instruction for generated custom component (used with --use-custom-codegen).",
+    )
+    train_grp.add_argument(
+        "--generated-code-dir",
+        type=str,
+        default="generated_code",
+        metavar="DIR",
+        help="Directory to save generated Python modules (default: generated_code).",
+    )
 
     return p.parse_args()
 
@@ -212,7 +328,14 @@ def main():
     if args.data:
         loader = CSVDataLoader()
         sheet: int | str = int(args.sheet) if args.sheet.isdigit() else args.sheet
-        data_config: dict = {"path": args.data, "sheet_name": sheet}
+        data_config: dict = {
+            "path": args.data,
+            "sheet_name": sheet,
+            "header_row": args.header_row,
+            "drop_na": not args.keep_na,
+            "impute_missing": args.impute_missing,
+            "auto_recover_small_sample": True,
+        }
         if args.target:
             data_config["target"] = args.target
         if args.features:
@@ -225,7 +348,15 @@ def main():
             "random_seed": args.random_seed,
         }
 
-    task_type = args.task_type
+    task_type = _resolve_task_type(
+        agent,
+        loader,
+        data_config,
+        args.motivation,
+        args.background_knowledge,
+        args.task_type,
+        use_llm=not args.no_llm,
+    )
 
     # Wrap interactive chooser to pass task_type
     def choose_model(agent, metadata, suggestions):
@@ -236,6 +367,7 @@ def main():
         interface=loader,
         data_config=data_config,
         motivation=args.motivation,
+        background_knowledge=args.background_knowledge,
         task_type=task_type,
         use_hyperparameter_tuning=not args.no_tuning,
         use_randomized_search=args.randomized_search,
@@ -244,6 +376,9 @@ def main():
         choose_model_fn=choose_model,
         use_llm=not args.no_llm,
         fixed_model=args.model,
+        use_custom_codegen=args.use_custom_codegen,
+        custom_code_request=args.custom_code_request,
+        generated_code_dir=args.generated_code_dir,
     )
 
     # Print results
@@ -265,6 +400,11 @@ def main():
         print(f"  Chosen model : {result.suggestion.model_name}")
         print(f"  Package      : {result.suggestion.package_name}")
         print(f"  Reason       : {result.suggestion.reason}")
+    if result.generated_code_path:
+        print("\nCustom code component:")
+        print(f"  Module path  : {result.generated_code_path}")
+        if result.generated_code_note:
+            print(f"  Agent note   : {result.generated_code_note}")
 
     if args.skip_train:
         print("\n(Skipping train/report: --skip-train)")

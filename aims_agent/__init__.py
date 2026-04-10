@@ -1,11 +1,28 @@
 """AI Agent for ML in Materials Science."""
 
 from aims_agent.agent import Agent, PipelineResult
-from aims_agent.orchestrator import ModelClassResolution, resolve_model_class_multi_agent
+from aims_agent.orchestrator import (
+    ModelClassResolution,
+    TrainingPhaseResult,
+    resolve_model_class_multi_agent,
+    run_training_phase_multi_agent,
+    run_training_phase_multi_agent_with_fallback,
+)
+from aims_agent.agents.debug_agent import (
+    DebugPatchResult,
+    RetryDecision,
+    SelfCorrectionAgent,
+    repair_model_module_code,
+)
 from aims_agent.path_resolver import ExecutionPathResolver, PathDecision, PathKind
 from aims_agent.specs import CodeGenSpec, build_model_codegen_spec
-from aims_agent.validator import validate_training_result
-from aims_agent.validator import validate_dl_training_trace
+from aims_agent.validator import (
+    ValidationOutcome,
+    validate_estimator_contract,
+    validate_training_result_detailed,
+    validate_training_result,
+    validate_dl_training_trace,
+)
 from aims_agent.llm import LMF_LLM
 from aims_agent.planning import plan_steps
 from aims_agent.data_interface import (
@@ -48,12 +65,22 @@ __all__ = [
     "Agent",
     "PipelineResult",
     "ModelClassResolution",
+    "TrainingPhaseResult",
     "resolve_model_class_multi_agent",
+    "run_training_phase_multi_agent",
+    "run_training_phase_multi_agent_with_fallback",
+    "DebugPatchResult",
+    "RetryDecision",
+    "SelfCorrectionAgent",
+    "repair_model_module_code",
     "ExecutionPathResolver",
     "PathDecision",
     "PathKind",
     "CodeGenSpec",
     "build_model_codegen_spec",
+    "ValidationOutcome",
+    "validate_estimator_contract",
+    "validate_training_result_detailed",
     "validate_training_result",
     "validate_dl_training_trace",
     "LMF_LLM",

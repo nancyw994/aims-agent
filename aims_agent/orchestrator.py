@@ -11,13 +11,17 @@ import traceback
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
+
+import numpy as np
 
 from aims_agent.agents.codegen_agent import generate_model_estimator_module, load_generated_estimator_class
-from aims_agent.agents.debug_agent import repair_model_module_code
+from aims_agent.agents.debug_agent import SelfCorrectionAgent
 from aims_agent.model_selector import ModelSuggestion, load_model_class
+from aims_agent.model_trainer import ModelTrainer
 from aims_agent.path_resolver import ExecutionPathResolver, PathDecision
 from aims_agent.specs import build_model_codegen_spec
+from aims_agent.validator import validate_estimator_contract, validate_training_result_detailed
 
 
 @dataclass
@@ -44,6 +48,18 @@ class DebugAttemptRecord:
     patch_summary: str = ""
     patched: bool = False
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+
+
+@dataclass
+class TrainingPhaseResult:
+    y_true: np.ndarray
+    y_pred: np.ndarray
+    resolution: ModelClassResolution
+    used_suggestion: ModelSuggestion
+    fallback_used: bool
+    training_validation_ok: bool
+    training_validation_code: str
+    training_validation_message: str
 
 
 def _error_signature(exc: Exception) -> str:
@@ -80,18 +96,19 @@ def _codegen_model_class(
         module_name=module_name,
     )
     code = Path(file_path_str).read_text(encoding="utf-8")
+    self_correction_agent = SelfCorrectionAgent(agent)
     log_path = Path(generated_code_dir).resolve() / f"self_correction_{module_name}.jsonl"
     repeated_sig_count = 0
     prev_sig = ""
+    records: list[DebugAttemptRecord] = []
     last_err: str | None = None
     for attempt in range(max_codegen_retries + 1):
         try:
             cls = load_generated_estimator_class(file_path_str)
-            summary = (
-                "No correction required."
-                if attempt == 0
-                else f"Self-correction succeeded after {attempt} retry attempt(s)."
-            )
+            contract = validate_estimator_contract(cls, task_type=task_type)
+            if not contract.ok:
+                raise RuntimeError(f"[{contract.code}] {contract.message}")
+            summary = self_correction_agent.summarize([asdict(r) for r in records])
             return ModelClassResolution(
                 model_class=cls,
                 execution_path="codegen",
@@ -117,25 +134,30 @@ def _codegen_model_class(
                 traceback=tb_text,
                 offending_code=code,
             )
-            if attempt >= max_codegen_retries:
-                _write_self_correction_log(log_path, rec)
-                break
-            if repeated_sig_count >= 2:
-                rec.patch_summary = "Stop early due to repeated identical error signature."
+            decision = self_correction_agent.should_retry(
+                attempt=attempt,
+                max_retries=max_codegen_retries,
+                repeated_error_count=repeated_sig_count,
+            )
+            if not decision.retry:
+                rec.patch_summary = decision.reason
                 _write_self_correction_log(log_path, rec)
                 break
 
-            patch = repair_model_module_code(
-                agent,
+            patch = self_correction_agent.propose_fix(
                 spec=spec,
                 broken_code=code,
-                error_message=f"{last_err}\n\nTraceback:\n{tb_text}",
+                error_message=last_err,
+                traceback_text=tb_text,
+                attempt=attempt,
+                recent_patch_summary=records[-1].patch_summary if records else "",
             )
             code = patch.corrected_code
             rec.diagnosis = patch.diagnosis
             rec.patch_summary = patch.patch_summary
             rec.patched = True
             _write_self_correction_log(log_path, rec)
+            records.append(rec)
             Path(file_path_str).write_text(code, encoding="utf-8")
 
     fail_summary = (
@@ -217,4 +239,225 @@ def resolve_model_class_multi_agent(
     raise RuntimeError(f"Unexpected execution path: {path!r}")
 
 
-__all__ = ["ModelClassResolution", "resolve_model_class_multi_agent"]
+def repair_generated_model_after_runtime_validation(
+    agent: Any,
+    *,
+    model_module_path: str,
+    suggestion: ModelSuggestion,
+    task_type: str,
+    metadata: Mapping[str, Any],
+    validation_error: str,
+    max_codegen_retries: int = 1,
+) -> ModelClassResolution:
+    """
+    Repair an already-generated module when runtime/post-train validation fails.
+    """
+    file_path = Path(model_module_path)
+    _ = metadata
+    if not file_path.exists():
+        raise RuntimeError(f"Generated model module not found: {model_module_path}")
+    code = file_path.read_text(encoding="utf-8")
+    sc = SelfCorrectionAgent(agent)
+    spec = build_model_codegen_spec(
+        suggestion,
+        task_type,
+        PathDecision("codegen", "Runtime validation failed; repair generated module."),
+    )
+    last_err = validation_error
+    for attempt in range(max(1, max_codegen_retries)):
+        patch = sc.propose_fix(
+            spec=spec,
+            broken_code=code,
+            error_message=last_err,
+            attempt=attempt,
+        )
+        code = patch.corrected_code
+        file_path.write_text(code, encoding="utf-8")
+        try:
+            cls = load_generated_estimator_class(file_path)
+            contract = validate_estimator_contract(cls, task_type=task_type)
+            if not contract.ok:
+                raise RuntimeError(f"[{contract.code}] {contract.message}")
+            return ModelClassResolution(
+                model_class=cls,
+                execution_path="codegen",
+                path_reason="runtime_validation_repaired",
+                generated_model_wrapper_path=str(file_path),
+                self_correction_attempts=attempt + 1,
+                self_correction_success=True,
+                self_correction_summary=f"Runtime validation repaired in {attempt + 1} attempt(s).",
+            )
+        except Exception as e:
+            last_err = str(e)
+    raise RuntimeError(f"Runtime validation repair failed: {last_err}")
+
+
+def run_training_phase_multi_agent(
+    agent: Any,
+    *,
+    suggestion: ModelSuggestion,
+    task_type: str,
+    metadata: Mapping[str, Any],
+    df: Any,
+    use_llm: bool = True,
+    background_knowledge: str | None = None,
+    generated_code_dir: str = "generated_code",
+    max_codegen_retries: int = 2,
+    use_hyperparameter_tuning: bool = True,
+    use_randomized_search: bool = False,
+) -> TrainingPhaseResult:
+    """
+    Unified training-phase control: resolve -> train -> validate -> (optional) repair+retrain.
+    """
+    mcr = resolve_model_class_multi_agent(
+        agent,
+        suggestion,
+        task_type,
+        metadata,
+        use_llm=use_llm,
+        background_knowledge=background_knowledge,
+        generated_code_dir=generated_code_dir,
+        max_codegen_retries=max(0, max_codegen_retries),
+    )
+
+    trainer = ModelTrainer(
+        mcr.model_class,
+        task_type=task_type,
+        use_hyperparameter_tuning=use_hyperparameter_tuning,
+        use_randomized_search=use_randomized_search,
+    )
+    trainer.prepare_data(df, list(metadata["features"]), str(metadata["target"]))
+    trainer.train()
+    y_true, y_pred = trainer.predict()
+    validation = validate_training_result_detailed(y_true, y_pred, task_type=task_type)
+    if validation.ok:
+        return TrainingPhaseResult(
+            y_true=np.asarray(y_true),
+            y_pred=np.asarray(y_pred),
+            resolution=mcr,
+            used_suggestion=suggestion,
+            fallback_used=False,
+            training_validation_ok=True,
+            training_validation_code=validation.code,
+            training_validation_message=validation.message,
+        )
+
+    # execution-level correction: only for generated modules
+    if not (
+        use_llm
+        and mcr.execution_path == "codegen"
+        and mcr.generated_model_wrapper_path
+    ):
+        return TrainingPhaseResult(
+            y_true=np.asarray(y_true),
+            y_pred=np.asarray(y_pred),
+            resolution=mcr,
+            used_suggestion=suggestion,
+            fallback_used=False,
+            training_validation_ok=False,
+            training_validation_code=validation.code,
+            training_validation_message=validation.message,
+        )
+
+    repaired = repair_generated_model_after_runtime_validation(
+        agent,
+        model_module_path=mcr.generated_model_wrapper_path,
+        suggestion=suggestion,
+        task_type=task_type,
+        metadata=metadata,
+        validation_error=f"[{validation.code}] {validation.message}",
+        max_codegen_retries=max(1, max_codegen_retries),
+    )
+    # aggregate correction stats in one place
+    mcr.self_correction_attempts += repaired.self_correction_attempts
+    mcr.self_correction_success = repaired.self_correction_success
+    if repaired.self_correction_summary:
+        mcr.self_correction_summary = repaired.self_correction_summary
+
+    trainer = ModelTrainer(
+        repaired.model_class,
+        task_type=task_type,
+        use_hyperparameter_tuning=use_hyperparameter_tuning,
+        use_randomized_search=use_randomized_search,
+    )
+    trainer.prepare_data(df, list(metadata["features"]), str(metadata["target"]))
+    trainer.train()
+    y_true, y_pred = trainer.predict()
+    final_validation = validate_training_result_detailed(y_true, y_pred, task_type=task_type)
+    return TrainingPhaseResult(
+        y_true=np.asarray(y_true),
+        y_pred=np.asarray(y_pred),
+        resolution=mcr,
+        used_suggestion=suggestion,
+        fallback_used=False,
+        training_validation_ok=final_validation.ok,
+        training_validation_code=final_validation.code,
+        training_validation_message=final_validation.message,
+    )
+
+
+def run_training_phase_multi_agent_with_fallback(
+    agent: Any,
+    *,
+    suggestion: ModelSuggestion,
+    fallback_suggestion: ModelSuggestion | None,
+    ensure_package_installed_fn: Callable[[str], bool],
+    task_type: str,
+    metadata: Mapping[str, Any],
+    df: Any,
+    use_llm: bool = True,
+    background_knowledge: str | None = None,
+    generated_code_dir: str = "generated_code",
+    max_codegen_retries: int = 2,
+    use_hyperparameter_tuning: bool = True,
+    use_randomized_search: bool = False,
+) -> TrainingPhaseResult:
+    """
+    Training-phase control with built-in fallback model strategy.
+    """
+    try:
+        return run_training_phase_multi_agent(
+            agent,
+            suggestion=suggestion,
+            task_type=task_type,
+            metadata=metadata,
+            df=df,
+            use_llm=use_llm,
+            background_knowledge=background_knowledge,
+            generated_code_dir=generated_code_dir,
+            max_codegen_retries=max_codegen_retries,
+            use_hyperparameter_tuning=use_hyperparameter_tuning,
+            use_randomized_search=use_randomized_search,
+        )
+    except Exception:
+        if (
+            fallback_suggestion is None
+            or not ensure_package_installed_fn(fallback_suggestion.package_name)
+        ):
+            raise
+        out = run_training_phase_multi_agent(
+            agent,
+            suggestion=fallback_suggestion,
+            task_type=task_type,
+            metadata=metadata,
+            df=df,
+            use_llm=use_llm,
+            background_knowledge=background_knowledge,
+            generated_code_dir=generated_code_dir,
+            max_codegen_retries=max_codegen_retries,
+            use_hyperparameter_tuning=use_hyperparameter_tuning,
+            use_randomized_search=use_randomized_search,
+        )
+        out.used_suggestion = fallback_suggestion
+        out.fallback_used = True
+        return out
+
+
+__all__ = [
+    "ModelClassResolution",
+    "TrainingPhaseResult",
+    "resolve_model_class_multi_agent",
+    "repair_generated_model_after_runtime_validation",
+    "run_training_phase_multi_agent",
+    "run_training_phase_multi_agent_with_fallback",
+]

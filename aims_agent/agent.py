@@ -21,7 +21,10 @@ from aims_agent.llm import LMF_LLM
 from aims_agent.model_selector import ModelSuggestion, get_default_suggestion, get_model_suggestion, load_model_class, suggest_model, suggest_models
 from aims_agent.model_trainer import ModelTrainer
 from aims_agent.results_analyzer import compute_metrics, interpret_from_metrics, interpret_with_llm, plot_results
-from aims_agent.validator import validate_dl_training_trace, validate_training_result
+from aims_agent.validator import (
+    validate_dl_training_trace,
+    validate_training_result_detailed,
+)
 
 
 @dataclass
@@ -346,42 +349,33 @@ class Agent:
                     if suggestion is None:
                         continue
                     if multi_agent:
-                        from aims_agent.orchestrator import resolve_model_class_multi_agent
+                        from aims_agent.orchestrator import run_training_phase_multi_agent_with_fallback
 
-                        try:
-                            mcr = resolve_model_class_multi_agent(
-                                self,
-                                suggestion,
-                                task_type,
-                                metadata,
-                                use_llm=use_llm,
-                                background_knowledge=background_knowledge,
-                                generated_code_dir=generated_code_dir,
-                                max_codegen_retries=max(0, max_codegen_retries),
+                        fallback = get_default_suggestion(task_type)
+                        tpr = run_training_phase_multi_agent_with_fallback(
+                            self,
+                            suggestion=suggestion,
+                            fallback_suggestion=fallback,
+                            ensure_package_installed_fn=ensure_package_installed,
+                            task_type=task_type,
+                            metadata=metadata,
+                            df=bundle.df,
+                            use_llm=use_llm,
+                            background_knowledge=background_knowledge,
+                            generated_code_dir=generated_code_dir,
+                            max_codegen_retries=max(0, max_codegen_retries),
+                            use_hyperparameter_tuning=use_hyperparameter_tuning,
+                            use_randomized_search=use_randomized_search,
+                        )
+                        if tpr.fallback_used:
+                            print(
+                                f"[Multi-agent] primary model failed; falling back to {tpr.used_suggestion.model_name}"
                             )
-                        except Exception as e:
-                            fallback = get_default_suggestion(task_type)
-                            if fallback.package_name != suggestion.package_name and ensure_package_installed(
-                                fallback.package_name
-                            ):
-                                print(
-                                    f"[Multi-agent] resolve failed ({e}); falling back to {fallback.model_name}"
-                                )
-                                suggestion = fallback
-                                result.suggestion = suggestion
-                                mcr = resolve_model_class_multi_agent(
-                                    self,
-                                    suggestion,
-                                    task_type,
-                                    metadata,
-                                    use_llm=use_llm,
-                                    background_knowledge=background_knowledge,
-                                    generated_code_dir=generated_code_dir,
-                                    max_codegen_retries=max(0, max_codegen_retries),
-                                )
-                            else:
-                                raise
+                            suggestion = tpr.used_suggestion
+                            result.suggestion = suggestion
+                        mcr = tpr.resolution
                         model_class = mcr.model_class
+                        y_true, y_pred = tpr.y_true, tpr.y_pred
                         result.execution_path = mcr.execution_path
                         result.path_reason = mcr.path_reason
                         result.generated_model_wrapper_path = mcr.generated_model_wrapper_path or ""
@@ -389,6 +383,10 @@ class Agent:
                         result.self_correction_success = mcr.self_correction_success
                         result.self_correction_log_path = mcr.self_correction_log_path
                         result.self_correction_summary = mcr.self_correction_summary
+                        result.training_validation_ok = tpr.training_validation_ok
+                        result.training_validation_message = (
+                            f"[{tpr.training_validation_code}] {tpr.training_validation_message}"
+                        )
                         if result.generated_model_wrapper_path:
                             print(
                                 f"[Multi-agent] execution_path={result.execution_path} "
@@ -431,16 +429,18 @@ class Agent:
                             y_true, y_pred, task_type=task_type
                         )
                         if multi_agent:
-                            ok, msg = validate_training_result(
-                                y_true,
-                                y_pred,
-                                metrics=result.metrics,
-                                task_type=task_type,
-                            )
-                            result.training_validation_ok = ok
-                            result.training_validation_message = msg
-                            if not ok:
-                                print(f"[Validator] {msg}")
+                            if not result.training_validation_ok:
+                                # attach metric-level checks to existing train-phase validation status
+                                out = validate_training_result_detailed(
+                                    y_true,
+                                    y_pred,
+                                    metrics=result.metrics,
+                                    task_type=task_type,
+                                )
+                                result.training_validation_ok = out.ok
+                                result.training_validation_message = f"[{out.code}] {out.message}"
+                            if not result.training_validation_ok:
+                                print(f"[Validator] {result.training_validation_message}")
                     continue
 
                 # interpret

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import pandas as pd
 import pytest
 
 from aims_agent.agent import Agent
 from aims_agent.model_selector import ModelSuggestion, get_model_suggestion
-from aims_agent.orchestrator import resolve_model_class_multi_agent
+from aims_agent.orchestrator import (
+    resolve_model_class_multi_agent,
+    run_training_phase_multi_agent_with_fallback,
+)
 
 # Minimal valid module matching CodeGen contract (returned by mock LLM)
 _MOCK_GENERATED_ESTIMATOR = '''```python
@@ -129,3 +133,39 @@ def test_codegen_self_correction_retry_and_log(tmp_path):
     assert r.self_correction_attempts >= 1
     assert r.self_correction_log_path.endswith(".jsonl")
     assert (tmp_path / "gen").exists()
+
+
+def test_training_phase_with_fallback_uses_default_model(tmp_path):
+    agent = Agent(llm_call=lambda _: _MOCK_GENERATED_ESTIMATOR)
+    primary = ModelSuggestion(
+        model_name="UnknownZZ3",
+        package_name="scikit-learn",
+        import_path="nonexistent_xyz_abc.ModCls",
+        reason="force fail without llm",
+    )
+    fallback = get_model_suggestion("RandomForestRegressor", "regression")
+    assert fallback is not None
+    df = pd.DataFrame(
+        {
+            "f1": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            "f2": [1.0, 1.2, 1.4, 1.6, 1.8, 2.0],
+            "t": [2.1, 2.3, 2.6, 2.8, 3.0, 3.2],
+        }
+    )
+    meta = {"features": ["f1", "f2"], "target": "t", "description": "d"}
+    out = run_training_phase_multi_agent_with_fallback(
+        agent,
+        suggestion=primary,
+        fallback_suggestion=fallback,
+        ensure_package_installed_fn=lambda _: True,
+        task_type="regression",
+        metadata=meta,
+        df=df,
+        use_llm=False,
+        generated_code_dir=str(tmp_path / "gen"),
+        max_codegen_retries=0,
+        use_hyperparameter_tuning=False,
+    )
+    assert out.fallback_used is True
+    assert out.used_suggestion.model_name == "RandomForestRegressor"
+    assert out.training_validation_ok is True

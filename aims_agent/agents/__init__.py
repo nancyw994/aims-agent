@@ -5,11 +5,12 @@ from aims_agent.agents.codegen_agent import (
     generate_model_estimator_module,
     load_generated_estimator_class,
 )
-from aims_agent.agents.debug_agent import repair_model_module_code
+from aims_agent.agents.debug_agent import SelfCorrectionAgent, repair_model_module_code
 
 __all__ = [
     "GENERATED_ESTIMATOR_CLASS_NAME",
     "generate_model_estimator_module",
     "load_generated_estimator_class",
+    "SelfCorrectionAgent",
     "repair_model_module_code",
 ]

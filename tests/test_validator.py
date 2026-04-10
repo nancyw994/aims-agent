@@ -5,7 +5,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from aims_agent.validator import validate_dl_training_trace, validate_training_result
+from aims_agent.validator import (
+    validate_dl_training_trace,
+    validate_estimator_contract,
+    validate_training_result,
+    validate_training_result_detailed,
+)
 
 
 def test_validate_ok_regression():
@@ -41,6 +46,16 @@ def test_validate_bad_metric():
     assert "R2" in msg
 
 
+def test_validate_training_result_detailed_code():
+    out = validate_training_result_detailed(
+        np.array([1.0, 2.0]),
+        np.array([1.0, np.nan]),
+        task_type="regression",
+    )
+    assert not out.ok
+    assert out.code == "nan_inf_predictions"
+
+
 def test_validate_regression_constant_pred_heuristic():
     yt = np.linspace(0, 10, 20)
     yp = np.ones(20) * 3.0
@@ -65,3 +80,28 @@ def test_validate_dl_training_trace_bad_gradients():
     ok, msg = validate_dl_training_trace([1.2, 1.0], [0.0, 0.0])
     assert not ok
     assert "backward" in msg or "zero" in msg
+
+
+def test_validate_estimator_contract_ok():
+    class GoodEstimator:
+        def fit(self, X, y):
+            return self
+
+        def predict(self, X):
+            x = np.asarray(X)
+            n = x.shape[0] if x.ndim > 1 else len(x)
+            return np.zeros(n, dtype=float)
+
+    out = validate_estimator_contract(GoodEstimator, task_type="regression")
+    assert out.ok
+    assert out.code == "ok"
+
+
+def test_validate_estimator_contract_missing_predict():
+    class BadEstimator:
+        def fit(self, X, y):
+            return self
+
+    out = validate_estimator_contract(BadEstimator, task_type="regression")
+    assert not out.ok
+    assert out.code == "missing_interface"

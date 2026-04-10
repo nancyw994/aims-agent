@@ -15,6 +15,10 @@ results/
 
 # Python
 __pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+
 *.py[cod]
 *.pyo
 *.egg-info/

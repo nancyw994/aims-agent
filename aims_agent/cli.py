@@ -293,6 +293,21 @@ Examples:
         metavar="DIR",
         help="Directory to save generated Python modules (default: generated_code).",
     )
+    train_grp.add_argument(
+        "--multi-agent",
+        action="store_true",
+        help=(
+            "Use Execution Path Resolver (builtin / dynamic_import / codegen) before training; "
+            "optional model CodeGen + debug retries when no reliable import path."
+        ),
+    )
+    train_grp.add_argument(
+        "--max-codegen-retries",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Max LLM repair rounds after failed load of generated estimator (default: 2).",
+    )
 
     return p.parse_args()
 
@@ -379,6 +394,8 @@ def main():
         use_custom_codegen=args.use_custom_codegen,
         custom_code_request=args.custom_code_request,
         generated_code_dir=args.generated_code_dir,
+        multi_agent=args.multi_agent,
+        max_codegen_retries=args.max_codegen_retries,
     )
 
     # Print results
@@ -400,11 +417,30 @@ def main():
         print(f"  Chosen model : {result.suggestion.model_name}")
         print(f"  Package      : {result.suggestion.package_name}")
         print(f"  Reason       : {result.suggestion.reason}")
+    if args.multi_agent and (result.execution_path or result.path_reason):
+        print("\nExecution path (multi-agent):")
+        print(f"  Path   : {result.execution_path or '(n/a)'}")
+        print(f"  Reason : {result.path_reason or '(n/a)'}")
+        if result.generated_model_wrapper_path:
+            print(f"  Generated model module: {result.generated_model_wrapper_path}")
+        if result.training_validation_message:
+            print(
+                f"  Training validation: {'OK' if result.training_validation_ok else 'WARN'} — "
+                f"{result.training_validation_message}"
+            )
     if result.generated_code_path:
         print("\nCustom code component:")
         print(f"  Module path  : {result.generated_code_path}")
         if result.generated_code_note:
             print(f"  Agent note   : {result.generated_code_note}")
+    if args.multi_agent and (result.self_correction_summary or result.self_correction_log_path):
+        print("\nSelf-correction:")
+        print(f"  Attempts     : {result.self_correction_attempts}")
+        print(f"  Success      : {result.self_correction_success}")
+        if result.self_correction_summary:
+            print(f"  Summary      : {result.self_correction_summary}")
+        if result.self_correction_log_path:
+            print(f"  Log path     : {result.self_correction_log_path}")
 
     if args.skip_train:
         print("\n(Skipping train/report: --skip-train)")

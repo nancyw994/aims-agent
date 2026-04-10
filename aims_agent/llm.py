@@ -1,11 +1,17 @@
 import os
 import time
-from openai import OpenAI
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+# OpenAI (api.openai.com) — when OPENAI_API_KEY is set (takes precedence)
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+
+# OpenRouter — when only OPENROUTER_API_KEY is set
+DEFAULT_OPENROUTER_MODEL = "google/gemma-4-26b-a4b-it:free"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
 RETRY_CODES = (502, 503, 504)
 MAX_RETRIES = 3
 RETRY_DELAY = 5
@@ -21,14 +27,38 @@ def _is_retriable(completion) -> bool:
 
 
 def LMF_LLM(prompt: str) -> str:
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        raise RuntimeError("Set OPENROUTER_API_KEY in .env")
-    model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
-    client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=api_key,
-    )
+    """
+    Chat completion via the OpenAI Python SDK.
+
+    Do not import ``openai`` at module level: importing ``aims_agent`` (e.g. in
+    tests) must work even when ``openai`` is not installed until a call is made.
+
+    Providers (first match wins):
+    - OPENAI_API_KEY → official OpenAI (OPENAI_MODEL, default gpt-4o-mini)
+    - OPENROUTER_API_KEY → OpenRouter (OPENROUTER_MODEL, default gemma free tier)
+    """
+    try:
+        from openai import OpenAI
+    except ImportError as e:
+        raise RuntimeError(
+            "The 'openai' package is required for LMF_LLM. Install: pip install openai"
+        ) from e
+
+    openai_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    router_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+
+    if openai_key:
+        model = os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+        client = OpenAI(api_key=openai_key)
+        provider_label = "OpenAI"
+    elif router_key:
+        model = os.getenv("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL)
+        client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=router_key)
+        provider_label = "OpenRouter"
+    else:
+        raise RuntimeError(
+            "Set OPENAI_API_KEY (OpenAI) or OPENROUTER_API_KEY (OpenRouter) in .env"
+        )
 
     last_error = None
     for attempt in range(MAX_RETRIES):
@@ -46,7 +76,7 @@ def LMF_LLM(prompt: str) -> str:
                 print(f"[LLM] 504/502/503，after {wait}s retry ({attempt + 1}/{MAX_RETRIES})...")
                 time.sleep(wait)
                 continue
-        msg = "OpenRouter returned no choices (empty or rate-limited?)."
+        msg = f"{provider_label} returned no choices (empty or rate-limited?)."
         if hasattr(completion, "error") and completion.error:
             msg += f" API error: {completion.error}"
         raise RuntimeError(msg)

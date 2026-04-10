@@ -5,7 +5,56 @@ import importlib.util
 import re
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
+
+import numpy as np
+
+CodegenMode = Literal["standard", "deep_learning"]
+DLBackend = Literal["torch", "tensorflow"]
+
+
+def infer_codegen_mode(request: str | None) -> CodegenMode:
+    """Infer code generation mode from user request text."""
+    text = (request or "").lower()
+    dl_keys = (
+        "torch",
+        "pytorch",
+        "tensorflow",
+        "keras",
+        "neural network",
+        "deep learning",
+        "custom loss",
+        "physics-informed",
+        "layer",
+    )
+    return "deep_learning" if any(k in text for k in dl_keys) else "standard"
+
+
+def codegen_required_packages(mode: CodegenMode) -> list[str]:
+    """Return pip package names needed by selected codegen mode."""
+    if mode == "deep_learning":
+        return ["torch"]
+    return []
+
+
+def infer_preferred_dl_backend(request: str | None) -> DLBackend:
+    """Infer preferred deep-learning backend from request."""
+    text = (request or "").lower()
+    if any(k in text for k in ("tensorflow", "keras")):
+        return "tensorflow"
+    return "torch"
+
+
+def dl_backend_candidates(preferred: DLBackend) -> list[DLBackend]:
+    """Return backend candidates in priority order (for fallback)."""
+    return [preferred, "torch" if preferred == "tensorflow" else "tensorflow"]
+
+
+def dl_backend_required_packages(backend: DLBackend) -> list[str]:
+    """Return pip package names for a backend."""
+    if backend == "tensorflow":
+        return ["tensorflow-cpu"]
+    return ["torch"]
 
 
 def build_code_generation_prompt(
@@ -14,6 +63,7 @@ def build_code_generation_prompt(
     dataset_metadata: Mapping[str, Any],
     background_knowledge: str | None = None,
     task_type: str = "regression",
+    codegen_mode: CodegenMode = "standard",
 ) -> str:
     """
     Build a strict prompt for generating an executable custom component.
@@ -31,18 +81,31 @@ Dataset metadata:
     if background_knowledge:
         prompt += f"\nBackground knowledge / constraints:\n{background_knowledge.strip()}\n"
 
-    prompt += """
+    if codegen_mode == "deep_learning":
+        dep_line = "numpy, pandas, sklearn; and torch (or tensorflow only if explicitly requested)."
+        mode_extra = """
+6) Deep-learning mode:
+   - You may implement a small 2-layer NN and/or custom loss/layer logic.
+   - Keep runtime lightweight for small synthetic datasets.
+   - Convert pandas/numpy inputs safely; return numpy outputs where applicable.
+"""
+    else:
+        dep_line = "pandas, numpy, sklearn only (if needed)."
+        mode_extra = ""
+
+    prompt += f"""
 Return ONLY Python code in one ```python``` block. No explanations.
 
 Hard requirements:
 1) The module MUST define:
    def run_component(df, features, target, task_type="regression"):
        ...
-       return {"features": features, "note": "short summary"}
+       return {{"features": features, "note": "short summary"}}
 2) Do not read/write files.
 3) Do not use subprocess, os.system, eval, exec, network calls, or shell commands.
-4) Keep dependencies standard: pandas, numpy, sklearn only (if needed).
+4) Keep dependencies: {dep_line}
 5) The function must be robust and not crash on small datasets.
+{mode_extra}
 """
     return prompt
 
@@ -88,6 +151,7 @@ def generate_code_file(
     dataset_metadata: Mapping[str, Any],
     background_knowledge: str | None = None,
     task_type: str = "regression",
+    codegen_mode: CodegenMode = "standard",
     output_dir: str | Path = "generated_code",
     module_name: str = "custom_component",
 ) -> str:
@@ -99,6 +163,7 @@ def generate_code_file(
         dataset_metadata=dataset_metadata,
         background_knowledge=background_knowledge,
         task_type=task_type,
+        codegen_mode=codegen_mode,
     )
     response = agent.call_llm(prompt)
     code = extract_python_code(response)
@@ -142,7 +207,37 @@ def execute_generated_component(
     return result
 
 
+def validate_component_output(
+    result: dict[str, Any],
+    *,
+    original_features: list[str],
+    row_count: int | None = None,
+) -> tuple[bool, str]:
+    """Basic sanity checks for generated component outputs."""
+    if not isinstance(result, dict):
+        return False, "run_component output must be a dict"
+    if "features" in result:
+        feats = result.get("features")
+        if not isinstance(feats, list) or not all(isinstance(f, str) for f in feats):
+            return False, "result['features'] must be a list[str]"
+        if not feats:
+            return False, "result['features'] cannot be empty"
+    if "predictions" in result and row_count is not None:
+        preds = np.asarray(result["predictions"]).ravel()
+        if preds.shape[0] != row_count:
+            return False, f"predictions length mismatch: {preds.shape[0]} != {row_count}"
+        if not np.isfinite(preds).all():
+            return False, "predictions contain NaN/Inf"
+    return True, "ok"
+
+
 __all__ = [
+    "CodegenMode",
+    "infer_codegen_mode",
+    "codegen_required_packages",
+    "infer_preferred_dl_backend",
+    "dl_backend_candidates",
+    "dl_backend_required_packages",
     "build_code_generation_prompt",
     "extract_python_code",
     "validate_python_syntax",
@@ -150,4 +245,5 @@ __all__ = [
     "generate_code_file",
     "load_generated_module",
     "execute_generated_component",
+    "validate_component_output",
 ]

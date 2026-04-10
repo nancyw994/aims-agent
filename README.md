@@ -73,7 +73,7 @@ python examples/week3_model_selection_examples.py
 **Full Phase 1 workflow:** DATA INTERFACE → PLAN → MODEL SELECT → TRAIN → REPORT.
 
 ```bash
-# Run full pipeline (requires OPENROUTER_API_KEY in .env)
+# Run full pipeline (set OPENAI_API_KEY or OPENROUTER_API_KEY in .env)
 python -m aims_agent --motivation "Predict hardness from composition and processing"
 
 # Stop after model selection (no training)

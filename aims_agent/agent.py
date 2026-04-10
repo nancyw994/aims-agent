@@ -4,7 +4,16 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, List, Literal, Mapping
 
-from aims_agent.code_writer import execute_generated_component, generate_code_file
+from aims_agent.code_writer import (
+    codegen_required_packages,
+    dl_backend_candidates,
+    dl_backend_required_packages,
+    execute_generated_component,
+    generate_code_file,
+    infer_preferred_dl_backend,
+    infer_codegen_mode,
+    validate_component_output,
+)
 from aims_agent.data_interface import DataInterface, DatasetBundle, get_metadata
 from aims_agent.dependency_manager import ensure_package_installed
 from aims_agent.distribution import analyze_distribution, plot_distribution
@@ -12,6 +21,7 @@ from aims_agent.llm import LMF_LLM
 from aims_agent.model_selector import ModelSuggestion, get_default_suggestion, get_model_suggestion, load_model_class, suggest_model, suggest_models
 from aims_agent.model_trainer import ModelTrainer
 from aims_agent.results_analyzer import compute_metrics, interpret_from_metrics, interpret_with_llm, plot_results
+from aims_agent.validator import validate_dl_training_trace, validate_training_result
 
 
 @dataclass
@@ -31,6 +41,16 @@ class PipelineResult:
     interpretation: str = ""
     success: bool = True
     error: str = ""
+    # Multi-agent execution path (model wrapper / resolver)
+    execution_path: str = ""
+    path_reason: str = ""
+    generated_model_wrapper_path: str = ""
+    training_validation_ok: bool = True
+    training_validation_message: str = ""
+    self_correction_attempts: int = 0
+    self_correction_success: bool = False
+    self_correction_log_path: str = ""
+    self_correction_summary: str = ""
 
 
 class Agent:
@@ -92,6 +112,8 @@ class Agent:
         use_custom_codegen: bool = False,
         custom_code_request: str | None = None,
         generated_code_dir: str = "generated_code",
+        multi_agent: bool = False,
+        max_codegen_retries: int = 2,
     ) -> PipelineResult:
         """
         Execute the full ML pipeline based on the LLM plan.
@@ -111,6 +133,9 @@ class Agent:
             choose_model_fn: Optional callback(agent, metadata, suggestions) -> ModelSuggestion.
             use_llm: If False, use default plan/model/interpretation (no API calls).
             fixed_model: If set, use this model name directly (skip LLM). Must be in list_all_models().
+            multi_agent: If True, use Execution Path Resolver (builtin / dynamic_import / codegen)
+                and optional model CodeGen + debug retries before training.
+            max_codegen_retries: Max LLM repair attempts after failed load of generated estimator.
 
         Returns:
             PipelineResult with steps, metrics, plot path, and LLM interpretation.
@@ -237,6 +262,37 @@ class Agent:
                         custom_code_request
                         or "Generate a robust custom preprocessing component for this materials dataset."
                     )
+                    codegen_mode = infer_codegen_mode(code_request)
+                    selected_dl_backend = ""
+                    for pkg in codegen_required_packages(codegen_mode):
+                        if not ensure_package_installed(pkg):
+                            result.success = False
+                            result.error = (
+                                f"CodeGen mode '{codegen_mode}' requires package '{pkg}', "
+                                "but installation failed."
+                            )
+                            return result
+                    if codegen_mode == "deep_learning":
+                        preferred = infer_preferred_dl_backend(code_request)
+                        install_errors: list[str] = []
+                        for backend in dl_backend_candidates(preferred):
+                            pkgs = dl_backend_required_packages(backend)
+                            if all(ensure_package_installed(pkg) for pkg in pkgs):
+                                selected_dl_backend = backend
+                                break
+                            install_errors.append(f"{backend}: failed to install {pkgs}")
+                        if not selected_dl_backend:
+                            result.success = False
+                            result.error = (
+                                "Deep-learning codegen backend install failed. Tried: "
+                                + " | ".join(install_errors)
+                            )
+                            return result
+                        code_request = (
+                            f"{code_request}\n\nBackend requirement: use {selected_dl_backend}."
+                            " Return optional loss_history (list of floats, >=2 steps) and "
+                            "optional gradient_norms in the output dict when training is performed."
+                        )
                     module_name = f"custom_component_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                     result.generated_code_path = generate_code_file(
                         self,
@@ -244,6 +300,7 @@ class Agent:
                         dataset_metadata=metadata,
                         background_knowledge=background_knowledge,
                         task_type=task_type,
+                        codegen_mode=codegen_mode,
                         output_dir=generated_code_dir,
                         module_name=module_name,
                     )
@@ -254,11 +311,32 @@ class Agent:
                         target=metadata["target"],
                         task_type=task_type,
                     )
+                    ok, msg = validate_component_output(
+                        cg_result,
+                        original_features=list(metadata["features"]),
+                        row_count=len(bundle.df),
+                    )
+                    if not ok:
+                        result.success = False
+                        result.error = f"Generated component output validation failed: {msg}"
+                        return result
+                    if codegen_mode == "deep_learning":
+                        dl_ok, dl_msg = validate_dl_training_trace(
+                            cg_result.get("loss_history"),
+                            cg_result.get("gradient_norms"),
+                            min_steps=2,
+                        )
+                        if not dl_ok:
+                            result.success = False
+                            result.error = f"Deep-learning component validation failed: {dl_msg}"
+                            return result
                     if "features" in cg_result and isinstance(cg_result["features"], list):
                         valid_features = [f for f in cg_result["features"] if f in bundle.df.columns]
                         if valid_features:
                             metadata["features"] = valid_features
-                    result.generated_code_note = str(cg_result.get("note", "")).strip()
+                    note = str(cg_result.get("note", "")).strip()
+                    backend_note = f", backend={selected_dl_backend}" if selected_dl_backend else ""
+                    result.generated_code_note = f"[mode={codegen_mode}{backend_note}] {note}".strip()
                     continue
 
                 # train
@@ -267,21 +345,73 @@ class Agent:
                         continue
                     if suggestion is None:
                         continue
-                    try:
-                        model_class = load_model_class(suggestion)
-                    except Exception as e:
-                        fallback = get_default_suggestion(task_type)
-                        if fallback.package_name != suggestion.package_name and ensure_package_installed(
-                            fallback.package_name
-                        ):
-                            print(
-                                f"[Model] loads {suggestion.model_name} failed ({e})then changes to {fallback.model_name}"
+                    if multi_agent:
+                        from aims_agent.orchestrator import resolve_model_class_multi_agent
+
+                        try:
+                            mcr = resolve_model_class_multi_agent(
+                                self,
+                                suggestion,
+                                task_type,
+                                metadata,
+                                use_llm=use_llm,
+                                background_knowledge=background_knowledge,
+                                generated_code_dir=generated_code_dir,
+                                max_codegen_retries=max(0, max_codegen_retries),
                             )
-                            suggestion = fallback
-                            result.suggestion = suggestion
-                            model_class = load_model_class(suggestion)
+                        except Exception as e:
+                            fallback = get_default_suggestion(task_type)
+                            if fallback.package_name != suggestion.package_name and ensure_package_installed(
+                                fallback.package_name
+                            ):
+                                print(
+                                    f"[Multi-agent] resolve failed ({e}); falling back to {fallback.model_name}"
+                                )
+                                suggestion = fallback
+                                result.suggestion = suggestion
+                                mcr = resolve_model_class_multi_agent(
+                                    self,
+                                    suggestion,
+                                    task_type,
+                                    metadata,
+                                    use_llm=use_llm,
+                                    background_knowledge=background_knowledge,
+                                    generated_code_dir=generated_code_dir,
+                                    max_codegen_retries=max(0, max_codegen_retries),
+                                )
+                            else:
+                                raise
+                        model_class = mcr.model_class
+                        result.execution_path = mcr.execution_path
+                        result.path_reason = mcr.path_reason
+                        result.generated_model_wrapper_path = mcr.generated_model_wrapper_path or ""
+                        result.self_correction_attempts = mcr.self_correction_attempts
+                        result.self_correction_success = mcr.self_correction_success
+                        result.self_correction_log_path = mcr.self_correction_log_path
+                        result.self_correction_summary = mcr.self_correction_summary
+                        if result.generated_model_wrapper_path:
+                            print(
+                                f"[Multi-agent] execution_path={result.execution_path} "
+                                f"model_module={result.generated_model_wrapper_path}"
+                            )
                         else:
-                            raise
+                            print(f"[Multi-agent] execution_path={result.execution_path} — {result.path_reason}")
+                    else:
+                        try:
+                            model_class = load_model_class(suggestion)
+                        except Exception as e:
+                            fallback = get_default_suggestion(task_type)
+                            if fallback.package_name != suggestion.package_name and ensure_package_installed(
+                                fallback.package_name
+                            ):
+                                print(
+                                    f"[Model] loads {suggestion.model_name} failed ({e})then changes to {fallback.model_name}"
+                                )
+                                suggestion = fallback
+                                result.suggestion = suggestion
+                                model_class = load_model_class(suggestion)
+                            else:
+                                raise
                     trainer = ModelTrainer(
                         model_class,
                         task_type=task_type,
@@ -300,6 +430,17 @@ class Agent:
                         result.plot_path = plot_results(
                             y_true, y_pred, task_type=task_type
                         )
+                        if multi_agent:
+                            ok, msg = validate_training_result(
+                                y_true,
+                                y_pred,
+                                metrics=result.metrics,
+                                task_type=task_type,
+                            )
+                            result.training_validation_ok = ok
+                            result.training_validation_message = msg
+                            if not ok:
+                                print(f"[Validator] {msg}")
                     continue
 
                 # interpret

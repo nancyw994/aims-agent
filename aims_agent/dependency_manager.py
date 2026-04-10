@@ -22,6 +22,7 @@ def is_installed(import_name):
 PIP_TO_IMPORT: dict[str, str] = {
     "scikit-learn": "sklearn",
     "scikit-learn-intelex": "sklearn",
+    "tensorflow-cpu": "tensorflow",
 }
 
 # Log file for installation errors

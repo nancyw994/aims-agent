@@ -202,7 +202,7 @@ class Agent:
                 if not action:
                     continue
 
-                # select_model 
+                # select_model
                 if action == "select_model":
                     if fixed_model:
                         suggestion = get_model_suggestion(fixed_model, task_type)
@@ -421,7 +421,7 @@ class Agent:
                     y_true, y_pred = trainer.predict()
                     continue
 
-                # evaluate 
+                # evaluate
                 if action == "evaluate":
                     if y_true is not None and y_pred is not None and suggestion is not None:
                         result.metrics = compute_metrics(y_true, y_pred, task_type=task_type)

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
@@ -66,6 +69,26 @@ def test_resolve_builtin_random_forest_no_llm():
     assert r.model_class.__name__ == "RandomForestRegressor"
     assert r.self_correction_attempts == 0
     assert "No self-correction needed" in r.self_correction_summary
+
+
+def test_resolve_builtin_random_forest_use_llm_true_still_no_codegen():
+    def _no_llm(_: str) -> str:
+        raise AssertionError("LLM should not be called when builtin path works")
+
+    agent = Agent(llm_call=_no_llm)
+    s = get_model_suggestion("RandomForestRegressor", "regression")
+    assert s is not None
+    meta = {"features": ["a"], "target": "y", "description": "t"}
+    r = resolve_model_class_multi_agent(
+        agent,
+        s,
+        "regression",
+        meta,
+        use_llm=True,
+        generated_code_dir="generated_code",
+    )
+    assert r.execution_path == "builtin"
+    assert r.generated_model_wrapper_path == ""
 
 
 def test_resolve_codegen_with_mock_llm(tmp_path):
@@ -133,6 +156,10 @@ def test_codegen_self_correction_retry_and_log(tmp_path):
     assert r.self_correction_attempts >= 1
     assert r.self_correction_log_path.endswith(".jsonl")
     assert (tmp_path / "gen").exists()
+    log_lines = [ln for ln in Path(r.self_correction_log_path).read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(log_lines) >= 1
+    first = json.loads(log_lines[0])
+    assert "failure_code" in first
 
 
 def test_training_phase_with_fallback_uses_default_model(tmp_path):

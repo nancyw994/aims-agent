@@ -9,10 +9,10 @@ load_dotenv()
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
 # OpenRouter — when only OPENROUTER_API_KEY is set
-DEFAULT_OPENROUTER_MODEL = "google/gemma-4-26b-a4b-it:free"
+DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-RETRY_CODES = (502, 503, 504)
+RETRY_CODES = (429, 502, 503, 504)
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
@@ -24,6 +24,20 @@ def _is_retriable(completion) -> bool:
     if isinstance(err, dict) and err.get("code") in RETRY_CODES:
         return True
     return False
+
+
+def _http_retry_status(exc: BaseException) -> int | None:
+    code = getattr(exc, "status_code", None)
+    if isinstance(code, int):
+        return code
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            c = err.get("code")
+            if isinstance(c, int):
+                return c
+    return None
 
 
 def LMF_LLM(prompt: str) -> str:
@@ -38,7 +52,7 @@ def LMF_LLM(prompt: str) -> str:
     - OPENROUTER_API_KEY → OpenRouter (OPENROUTER_MODEL, default gemma free tier)
     """
     try:
-        from openai import OpenAI
+        from openai import APIStatusError, OpenAI
     except ImportError as e:
         raise RuntimeError(
             "The 'openai' package is required for LMF_LLM. Install: pip install openai"
@@ -62,10 +76,22 @@ def LMF_LLM(prompt: str) -> str:
 
     last_error = None
     for attempt in range(MAX_RETRIES):
-        completion = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except APIStatusError as e:
+            status = _http_retry_status(e)
+            if status in RETRY_CODES and attempt < MAX_RETRIES - 1:
+                wait = RETRY_DELAY * (attempt + 1)
+                print(
+                    f"[LLM] HTTP {status}, retry in {wait}s ({attempt + 1}/{MAX_RETRIES})..."
+                )
+                time.sleep(wait)
+                last_error = e
+                continue
+            raise RuntimeError(f"LLM call failed: {e}") from e
         if completion.choices:
             content = completion.choices[0].message.content
             return content if content is not None else ""
@@ -73,7 +99,9 @@ def LMF_LLM(prompt: str) -> str:
             last_error = getattr(completion, "error", None)
             if attempt < MAX_RETRIES - 1:
                 wait = RETRY_DELAY * (attempt + 1)
-                print(f"[LLM] 504/502/503，after {wait}s retry ({attempt + 1}/{MAX_RETRIES})...")
+                print(
+                    f"[LLM] empty response / gateway error, after {wait}s retry ({attempt + 1}/{MAX_RETRIES})..."
+                )
                 time.sleep(wait)
                 continue
         msg = f"{provider_label} returned no choices (empty or rate-limited?)."

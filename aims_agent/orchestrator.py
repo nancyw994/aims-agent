@@ -17,7 +17,13 @@ import numpy as np
 
 from aims_agent.agents.codegen_agent import generate_model_estimator_module, load_generated_estimator_class
 from aims_agent.agents.debug_agent import SelfCorrectionAgent
-from aims_agent.model_selector import ModelSuggestion, load_model_class
+from aims_agent.failure_codes import (
+    FAILURE_REPEATED_ERROR_SIGNATURE,
+    FAILURE_RETRY_LIMIT_REACHED,
+    FAILURE_RUNTIME_EXCEPTION,
+    parse_failure_code_from_message,
+)
+from aims_agent.model_selector import ModelSuggestion, enrich_unknown_suggestion, load_model_class
 from aims_agent.model_trainer import ModelTrainer
 from aims_agent.path_resolver import ExecutionPathResolver, PathDecision
 from aims_agent.specs import build_model_codegen_spec
@@ -40,6 +46,7 @@ class ModelClassResolution:
 class DebugAttemptRecord:
     attempt: int
     step: str
+    failure_code: str
     exception_type: str
     error_message: str
     traceback: str
@@ -72,6 +79,30 @@ def _write_self_correction_log(log_path: Path, record: DebugAttemptRecord) -> No
         f.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
 
 
+def _should_trigger_codegen_for_selected_model(
+    *,
+    selected_model_name: str,
+    path: str,
+    use_llm: bool,
+    load_error: Exception | None = None,
+) -> tuple[bool, str]:
+    """
+    CodeGen policy:
+    - Only trigger for the currently selected model.
+    - Trigger when resolver path is 'codegen', or builtin/dynamic_import load failed.
+    """
+    if not use_llm:
+        return False, "LLM disabled; codegen unavailable."
+    if path == "codegen":
+        return True, f"Selected model {selected_model_name!r} requires codegen path."
+    if path in ("builtin", "dynamic_import") and load_error is not None:
+        return True, (
+            f"Selected model {selected_model_name!r} failed to load via {path}: {load_error}. "
+            "Falling back to codegen."
+        )
+    return False, "Selected model has a working non-codegen execution path."
+
+
 def _codegen_model_class(
     agent: Any,
     suggestion: ModelSuggestion,
@@ -102,11 +133,13 @@ def _codegen_model_class(
     prev_sig = ""
     records: list[DebugAttemptRecord] = []
     last_err: str | None = None
+    failure_code = FAILURE_RUNTIME_EXCEPTION
     for attempt in range(max_codegen_retries + 1):
         try:
             cls = load_generated_estimator_class(file_path_str)
             contract = validate_estimator_contract(cls, task_type=task_type)
             if not contract.ok:
+                failure_code = contract.code
                 raise RuntimeError(f"[{contract.code}] {contract.message}")
             summary = self_correction_agent.summarize([asdict(r) for r in records])
             return ModelClassResolution(
@@ -129,6 +162,7 @@ def _codegen_model_class(
             rec = DebugAttemptRecord(
                 attempt=attempt,
                 step="load_generated_estimator_class",
+                failure_code=failure_code,
                 exception_type=type(e).__name__,
                 error_message=last_err,
                 traceback=tb_text,
@@ -140,6 +174,10 @@ def _codegen_model_class(
                 repeated_error_count=repeated_sig_count,
             )
             if not decision.retry:
+                if attempt >= max_codegen_retries:
+                    rec.failure_code = FAILURE_RETRY_LIMIT_REACHED
+                elif repeated_sig_count >= 2:
+                    rec.failure_code = FAILURE_REPEATED_ERROR_SIGNATURE
                 rec.patch_summary = decision.reason
                 _write_self_correction_log(log_path, rec)
                 break
@@ -151,6 +189,7 @@ def _codegen_model_class(
                 traceback_text=tb_text,
                 attempt=attempt,
                 recent_patch_summary=records[-1].patch_summary if records else "",
+                previous_failures=[asdict(r) for r in records[-3:]],
             )
             code = patch.corrected_code
             rec.diagnosis = patch.diagnosis
@@ -202,10 +241,16 @@ def resolve_model_class_multi_agent(
                 self_correction_summary="No self-correction needed (non-codegen path).",
             )
         except Exception as e:
-            if use_llm:
+            should_codegen, codegen_reason = _should_trigger_codegen_for_selected_model(
+                selected_model_name=suggestion.model_name,
+                path=path,
+                use_llm=use_llm,
+                load_error=e,
+            )
+            if should_codegen:
                 fallback = PathDecision(
                     "codegen",
-                    f"{path} load failed ({e}); falling back to CodeGen",
+                    codegen_reason,
                 )
                 return _codegen_model_class(
                     agent,
@@ -220,18 +265,45 @@ def resolve_model_class_multi_agent(
             raise
 
     if path == "codegen":
-        if not use_llm:
+        should_codegen, codegen_reason = _should_trigger_codegen_for_selected_model(
+            selected_model_name=suggestion.model_name,
+            path=path,
+            use_llm=use_llm,
+        )
+        if not should_codegen:
             raise RuntimeError(
                 "Selected model has no builtin/dynamic import path; CodeGen requires LLM "
                 "(remove --no-llm or disable --multi-agent for this run)."
             )
+        # Unknown model: ask LLM for import path + implementation notes before codegen.
+        # This enriches the spec so codegen has a concrete import hint and constraints.
+        if use_llm and not suggestion.import_path:
+            suggestion = enrich_unknown_suggestion(agent, suggestion, task_type)
+            # Re-resolve: LLM may have provided a valid import_path → try dynamic_import first.
+            enriched_dec = resolver.resolve(suggestion)
+            if enriched_dec.path in ("builtin", "dynamic_import"):
+                try:
+                    cls = load_model_class(suggestion)
+                    return ModelClassResolution(
+                        model_class=cls,
+                        execution_path=enriched_dec.path,
+                        path_reason=enriched_dec.reason,
+                        generated_model_wrapper_path="",
+                        self_correction_summary="No self-correction needed (enriched import path).",
+                    )
+                except Exception:
+                    pass  # fall through to codegen with enriched hint
+        # Pass enriched reason as additional background knowledge for codegen.
+        enriched_bg = background_knowledge or ""
+        if suggestion.reason and suggestion.reason not in (enriched_bg or ""):
+            enriched_bg = f"{enriched_bg}\n{suggestion.reason}".strip()
         return _codegen_model_class(
             agent,
             suggestion,
             task_type,
             metadata,
-            dec,
-            background_knowledge=background_knowledge,
+            PathDecision("codegen", codegen_reason or dec.reason),
+            background_knowledge=enriched_bg or None,
             generated_code_dir=generated_code_dir,
             max_codegen_retries=max_codegen_retries,
         )
@@ -257,6 +329,8 @@ def repair_generated_model_after_runtime_validation(
     if not file_path.exists():
         raise RuntimeError(f"Generated model module not found: {model_module_path}")
     code = file_path.read_text(encoding="utf-8")
+    module_name = file_path.stem
+    log_path = file_path.parent.resolve() / f"self_correction_runtime_{module_name}.jsonl"
     sc = SelfCorrectionAgent(agent)
     spec = build_model_codegen_spec(
         suggestion,
@@ -264,12 +338,21 @@ def repair_generated_model_after_runtime_validation(
         PathDecision("codegen", "Runtime validation failed; repair generated module."),
     )
     last_err = validation_error
+    failure_code = parse_failure_code_from_message(validation_error)
     for attempt in range(max(1, max_codegen_retries)):
         patch = sc.propose_fix(
             spec=spec,
             broken_code=code,
             error_message=last_err,
             attempt=attempt,
+            previous_failures=[
+                {
+                    "attempt": attempt,
+                    "step": "runtime_validation_repair",
+                    "failure_code": failure_code,
+                    "error_message": last_err,
+                }
+            ],
         )
         code = patch.corrected_code
         file_path.write_text(code, encoding="utf-8")
@@ -285,10 +368,22 @@ def repair_generated_model_after_runtime_validation(
                 generated_model_wrapper_path=str(file_path),
                 self_correction_attempts=attempt + 1,
                 self_correction_success=True,
+                self_correction_log_path=str(log_path),
                 self_correction_summary=f"Runtime validation repaired in {attempt + 1} attempt(s).",
             )
         except Exception as e:
             last_err = str(e)
+            rec = DebugAttemptRecord(
+                attempt=attempt,
+                step="runtime_validation_repair",
+                failure_code=failure_code,
+                exception_type=type(e).__name__,
+                error_message=last_err,
+                traceback=traceback.format_exc(),
+                offending_code=code,
+                patched=True,
+            )
+            _write_self_correction_log(log_path, rec)
     raise RuntimeError(f"Runtime validation repair failed: {last_err}")
 
 

@@ -441,6 +441,8 @@ def main():
             print(f"  Summary      : {result.self_correction_summary}")
         if result.self_correction_log_path:
             print(f"  Log path     : {result.self_correction_log_path}")
+        if result.self_correction_report:
+            print(f"  Aggregation  : {result.self_correction_report.get('summary', '')}")
 
     if args.skip_train:
         print("\n(Skipping train/report: --skip-train)")

@@ -9,6 +9,21 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import numpy as np
+from aims_agent.failure_codes import (
+    FAILURE_COLLAPSED_PREDICTIONS,
+    FAILURE_EMPTY_ARRAYS,
+    FAILURE_FIT_ERROR,
+    FAILURE_INIT_ERROR,
+    FAILURE_INVALID_METRIC,
+    FAILURE_LENGTH_MISMATCH,
+    FAILURE_MISSING_INTERFACE,
+    FAILURE_NAN_INF_PREDICTIONS,
+    FAILURE_NONE_ARRAY,
+    FAILURE_OK,
+    FAILURE_PREDICT_ERROR,
+    FAILURE_PREDICT_LENGTH_ERROR,
+    FAILURE_PREDICT_SHAPE_ERROR,
+)
 
 
 @dataclass
@@ -35,11 +50,11 @@ def validate_estimator_contract(
     fit_fn = getattr(model_class, "fit", None)
     pred_fn = getattr(model_class, "predict", None)
     if not callable(fit_fn) or not callable(pred_fn):
-        return _out(False, "missing_interface", "model class missing callable fit/predict")
+        return _out(False, FAILURE_MISSING_INTERFACE, "model class missing callable fit/predict")
     try:
         model = model_class()
     except Exception as e:
-        return _out(False, "init_error", f"failed to instantiate model: {e}")
+        return _out(False, FAILURE_INIT_ERROR, f"failed to instantiate model: {e}")
 
     n = 8
     x = np.random.RandomState(42).randn(n, n_features)
@@ -47,18 +62,18 @@ def validate_estimator_contract(
     try:
         model.fit(x, y)
     except Exception as e:
-        return _out(False, "fit_error", f"fit failed in contract validation: {e}")
+        return _out(False, FAILURE_FIT_ERROR, f"fit failed in contract validation: {e}")
     try:
         yp = np.asarray(model.predict(x))
     except Exception as e:
-        return _out(False, "predict_error", f"predict failed in contract validation: {e}")
+        return _out(False, FAILURE_PREDICT_ERROR, f"predict failed in contract validation: {e}")
     if yp.ndim != 1:
-        return _out(False, "predict_shape_error", f"predict output must be 1d, got shape={yp.shape}")
+        return _out(False, FAILURE_PREDICT_SHAPE_ERROR, f"predict output must be 1d, got shape={yp.shape}")
     if yp.shape[0] != n:
-        return _out(False, "predict_length_error", f"predict output length {yp.shape[0]} != {n}")
+        return _out(False, FAILURE_PREDICT_LENGTH_ERROR, f"predict output length {yp.shape[0]} != {n}")
     if not np.isfinite(yp).all():
-        return _out(False, "nan_inf_predictions", "predict output contains NaN/Inf")
-    return _out(True, "ok", "ok")
+        return _out(False, FAILURE_NAN_INF_PREDICTIONS, "predict output contains NaN/Inf")
+    return _out(True, FAILURE_OK, "ok")
 
 
 def validate_training_result_detailed(
@@ -69,26 +84,26 @@ def validate_training_result_detailed(
     task_type: Literal["regression", "classification"] = "regression",
 ) -> ValidationOutcome:
     if y_true is None or y_pred is None:
-        return _out(False, "none_array", "y_true or y_pred is None")
+        return _out(False, FAILURE_NONE_ARRAY, "y_true or y_pred is None")
     yt = np.asarray(y_true).ravel()
     yp = np.asarray(y_pred).ravel()
     if yt.size == 0 or yp.size == 0:
-        return _out(False, "empty_arrays", "empty prediction arrays")
+        return _out(False, FAILURE_EMPTY_ARRAYS, "empty prediction arrays")
     if yt.shape[0] != yp.shape[0]:
-        return _out(False, "length_mismatch", f"length mismatch: y_true={yt.shape[0]} vs y_pred={yp.shape[0]}")
+        return _out(False, FAILURE_LENGTH_MISMATCH, f"length mismatch: y_true={yt.shape[0]} vs y_pred={yp.shape[0]}")
     if not np.isfinite(yp).all():
-        return _out(False, "nan_inf_predictions", "predictions contain NaN or Inf")
+        return _out(False, FAILURE_NAN_INF_PREDICTIONS, "predictions contain NaN or Inf")
     if metrics:
         for k, v in metrics.items():
             if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
-                return _out(False, "invalid_metric", f"invalid metric {k}={v}")
+                return _out(False, FAILURE_INVALID_METRIC, f"invalid metric {k}={v}")
     if task_type == "classification":
         if np.unique(yp).size == 1 and yt.size > 2:
-            return _out(False, "collapsed_predictions", "predictions are constant; model may have collapsed")
+            return _out(False, FAILURE_COLLAPSED_PREDICTIONS, "predictions are constant; model may have collapsed")
     else:
         if np.unique(yp).size == 1 and yt.size > 5 and float(np.std(yt)) > 1e-9:
-            return _out(False, "collapsed_predictions", "regression predictions are constant while target varies")
-    return _out(True, "ok", "ok")
+            return _out(False, FAILURE_COLLAPSED_PREDICTIONS, "regression predictions are constant while target varies")
+    return _out(True, FAILURE_OK, "ok")
 
 
 def validate_training_result(

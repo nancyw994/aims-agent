@@ -24,34 +24,52 @@ def build_model_estimator_prompt(
     background_knowledge: str | None,
 ) -> str:
     meta = compact_metadata_for_codegen(dataset_metadata)
-    prompt = f"""You are an expert Python ML engineer.
-Generate ONE Python module that defines a scikit-learn-compatible estimator class named `{GENERATED_ESTIMATOR_CLASS_NAME}`.
+    hint = (
+        f"Hint: try wrapping or delegating to {spec.import_path_hint!r} if it is importable and appropriate."
+        if spec.import_path_hint
+        else "Hint: implement directly with robust sklearn-compatible behavior."
+    )
+    prompt = f"""SYSTEM:
+You are a senior ML engineer generating robust model wrapper code.
 
-Code generation spec (JSON):
+TASK:
+Generate one complete, executable Python module for the selected model.
+
+INPUT:
+Spec:
 {json.dumps(spec.to_prompt_dict(), indent=2)}
 
 Dataset metadata (context only):
 {json.dumps(meta, indent=2)}
 
-The user intends to use this conceptual model: {spec.model_name!r}.
+Intent:
+The user selected conceptual model {spec.model_name!r}.
+{hint}
 """
-    if spec.import_path_hint:
-        prompt += f"\nHint: try wrapping or delegating to {spec.import_path_hint!r} if it is importable and appropriate.\n"
     if background_knowledge:
-        prompt += f"\nBackground / constraints:\n{background_knowledge.strip()}\n"
+        prompt += f"\nAdditional constraints:\n{background_knowledge.strip()}\n"
 
     prompt += f"""
-Return ONLY Python code in one ```python``` block. No explanations.
+CONSTRAINTS:
+- Must define class `{GENERATED_ESTIMATOR_CLASS_NAME}`
+- Must implement fit(self, X, y) and predict(self, X)
+- predict must return a 1D numpy array with length == number of rows in X
+- Handle both pandas.DataFrame and numpy.ndarray inputs
+- fit must return self
+- No file I/O, subprocess, os.system, eval, exec, or network
+- Prefer numpy + sklearn only
+- Keep deterministic defaults (set random_state=42 when applicable)
+- Do not rely on hardcoded feature names
 
-Hard requirements:
-1) Define class `{GENERATED_ESTIMATOR_CLASS_NAME}` with:
-   - def fit(self, X, y): ...
-   - def predict(self, X): ...
-2) X may be pandas.DataFrame or numpy.ndarray; use numpy.asarray where helpful. Do not require specific column names beyond matching n_features in fit/predict.
-3) predict(X) returns a 1-dimensional numpy array with length == number of rows in X.
-4) Task type is {spec.task_type!r}. Classification: integer/str labels ok if consistent. Regression: float outputs.
-5) No file I/O, subprocess, os.system, eval, exec, or network.
-6) Prefer numpy + sklearn only.
+SELF-CHECK BEFORE OUTPUT:
+- module is syntactically valid Python
+- class name is exactly `{GENERATED_ESTIMATOR_CLASS_NAME}`
+- methods `fit` and `predict` exist with required signatures
+- output shape requirement is satisfied
+
+OUTPUT FORMAT:
+Return ONLY Python code in one ```python``` block.
+No explanations outside the code block.
 """
     return prompt
 

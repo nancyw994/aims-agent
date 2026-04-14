@@ -199,14 +199,72 @@ def _filter_suggestions_for_task(
     suggestions: List[ModelSuggestion],
     task_type: str,
 ) -> List[ModelSuggestion]:
-    """Filter out model suggestions that do not match task type."""
+    """
+    Remove only models that are *known* to belong to the wrong task type.
+    Unknown models (not in MODEL_IMPORT_MAP) are kept so they can reach
+    the dynamic_import or codegen execution paths.
+    """
     if task_type not in {"regression", "classification"}:
         return suggestions
-    allowed = set(REGRESSION_MODELS if task_type == "regression" else CLASSIFICATION_MODELS)
-    filtered = [s for s in suggestions if s.model_name in allowed]
-    if len(filtered) < len(suggestions):
-        print(f"[ModelSelector] Removed {len(suggestions) - len(filtered)} task-mismatched model suggestion(s).")
+    wrong_task = set(
+        CLASSIFICATION_MODELS if task_type == "regression" else REGRESSION_MODELS
+    )
+    filtered = [s for s in suggestions if s.model_name not in wrong_task]
+    removed = len(suggestions) - len(filtered)
+    if removed:
+        print(f"[ModelSelector] Removed {removed} task-mismatched model suggestion(s).")
     return filtered
+
+
+def enrich_unknown_suggestion(
+    agent: "Agent",
+    suggestion: ModelSuggestion,
+    task_type: str,
+) -> ModelSuggestion:
+    """
+    When a model is not in MODEL_IMPORT_MAP and has no import_path, ask the LLM
+    for its full import path, pip package, and key implementation notes.
+    Returns an enriched ModelSuggestion so codegen has richer context.
+    """
+    prompt = f"""You are a Python ML expert. The user wants to use the model "{suggestion.model_name}" for a {task_type} task.
+
+Provide the following as JSON (no other text):
+{{
+  "import_path": "full.python.import.ClassName",
+  "package_name": "pip-install-name",
+  "implementation_notes": "1-2 sentences on key fit/predict implementation details"
+}}
+
+- import_path: exact Python dotted path (e.g. sklearn.gaussian_process.GaussianProcessRegressor)
+- package_name: pip package to install (e.g. scikit-learn, ngboost, gplearn)
+- implementation_notes: important constraints for the wrapper (output shape, required kwargs, etc.)
+
+Return ONLY valid JSON."""
+
+    try:
+        response = agent.call_llm(prompt)
+        cleaned = re.sub(r"```(?:json)?\s*", "", response).strip()
+        start = cleaned.find("{")
+        end = cleaned.rfind("}") + 1
+        if start != -1 and end > start:
+            data = json.loads(cleaned[start:end])
+            import_path = str(data.get("import_path", "")).strip()
+            package_name = str(data.get("package_name", "")).strip()
+            notes = str(data.get("implementation_notes", "")).strip()
+            enriched = ModelSuggestion(
+                model_name=suggestion.model_name,
+                package_name=package_name or suggestion.package_name,
+                import_path=import_path or suggestion.import_path,
+                reason=f"{suggestion.reason} | {notes}".strip(" |") if notes else suggestion.reason,
+            )
+            print(
+                f"[ModelSelector] Enriched '{suggestion.model_name}': "
+                f"import_path={enriched.import_path!r}, package={enriched.package_name!r}"
+            )
+            return enriched
+    except Exception as e:
+        print(f"[ModelSelector] Could not enrich suggestion for '{suggestion.model_name}': {e}")
+    return suggestion
 
 
 def suggest_model(
@@ -312,10 +370,13 @@ def _parse_responses(response: str) -> List[ModelSuggestion]:
             package_name = _normalize_package_name(model_name, package_name)
         elif data.get("import_path"):
             import_path = data["import_path"]
-            package_name = _package_from_import_path(import_path)  # derive from import_path; don't trust LLM
+            package_name = _package_from_import_path(import_path)
         else:
-            print(f"[ModelSelector] Item {idx+1} missing import_path and model '{model_name}' not in map, skipping.")
-            continue
+            # Unknown model with no import_path: pass through for codegen.
+            # ExecutionPathResolver will route it to LLM-generated wrapper.
+            import_path = ""
+            package_name = _normalize_package_name(model_name, package_name)
+            print(f"[ModelSelector] Item {idx+1}: '{model_name}' not in map and no import_path — will use codegen.")
         out.append(
             ModelSuggestion(
                 model_name=model_name,
@@ -356,7 +417,10 @@ def _parse_response(response: str) -> ModelSuggestion | None:
         import_path = data["import_path"]
         package_name = _package_from_import_path(import_path)
     else:
-        return None
+        # Unknown model, no import_path: pass through for codegen.
+        import_path = ""
+        package_name = _normalize_package_name(model_name, package_name)
+        print(f"[ModelSelector] '{model_name}' not in map and no import_path — will use codegen.")
     return ModelSuggestion(
         model_name=model_name,
         package_name=package_name,
@@ -395,6 +459,7 @@ __all__ = [
     "get_default_suggestion",
     "get_model_suggestion",
     "list_all_models",
+    "enrich_unknown_suggestion",
     "DEFAULT_SUGGESTION",
     "DEFAULT_CLASSIFICATION_SUGGESTION",
     "MODEL_IMPORT_MAP",

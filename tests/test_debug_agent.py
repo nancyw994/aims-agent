@@ -42,3 +42,34 @@ def test_self_correction_agent_retry_policy():
     assert d1.retry is True
     assert d2.retry is False
     assert d3.retry is False
+
+
+def test_self_correction_prompt_includes_previous_failures():
+    captured: dict[str, str] = {}
+
+    def llm(prompt: str) -> str:
+        captured["prompt"] = prompt
+        return """{
+  "diagnosis": "x",
+  "patch_summary": "y",
+  "code": "class GeneratedEstimator:\\n    def fit(self, X, y):\\n        return self\\n\\n    def predict(self, X):\\n        import numpy as np\\n        x=np.asarray(X)\\n        n=x.shape[0] if x.ndim>1 else len(x)\\n        return np.zeros(n)\\n"
+}"""
+
+    agent = Agent(llm_call=llm)
+    spec = CodeGenSpec(
+        model_name="CustomReg",
+        task_type="regression",
+        required_interface="fit_predict",
+        import_path_hint="",
+        package_name="scikit-learn",
+        constraints=[],
+    )
+    sc = SelfCorrectionAgent(agent)
+    sc.propose_fix(
+        spec=spec,
+        broken_code="class Bad:\n    pass\n",
+        error_message="x",
+        previous_failures=[{"attempt": 0, "failure_code": "predict_shape_error"}],
+    )
+    assert "PREVIOUS FAILURES" in captured["prompt"]
+    assert "predict_shape_error" in captured["prompt"]

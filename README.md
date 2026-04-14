@@ -81,3 +81,17 @@ python -m aims_agent --motivation "..." --skip-train
 ```
 
 Outputs: metrics printed to console, plot at `results/model_performance.png`, and LLM interpretation of the results.
+
+---
+
+## Model CodeGen policy (selected-model first)
+
+Model CodeGen is used to **execute the selected model**, not to replace model selection.
+
+Execution order:
+
+1. Try builtin mapping for the selected model.
+2. Try dynamic import for the selected model.
+3. Only if both paths are unavailable or fail, trigger CodeGen for that same selected model.
+
+In other words, if a selected model already has a working builtin/dynamic path, CodeGen is not called.

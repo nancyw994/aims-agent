@@ -23,6 +23,8 @@ from aims_agent.validator import (
     validate_training_result,
     validate_dl_training_trace,
 )
+from aims_agent.failure_codes import ALL_FAILURE_CODES
+from aims_agent.self_correction_report import aggregate_self_correction_logs
 from aims_agent.llm import LMF_LLM
 from aims_agent.planning import plan_steps
 from aims_agent.data_interface import (
@@ -83,6 +85,8 @@ __all__ = [
     "validate_training_result_detailed",
     "validate_training_result",
     "validate_dl_training_trace",
+    "ALL_FAILURE_CODES",
+    "aggregate_self_correction_logs",
     "LMF_LLM",
     "plan_steps",
     "DatasetSchema",

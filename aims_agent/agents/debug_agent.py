@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from aims_agent.agents.codegen_agent import GENERATED_ESTIMATOR_CLASS_NAME
 from aims_agent.code_writer import extract_python_code, validate_python_syntax
@@ -73,20 +73,28 @@ class SelfCorrectionAgent:
         traceback_text: str = "",
         attempt: int = 0,
         recent_patch_summary: str = "",
+        previous_failures: Sequence[Mapping[str, Any]] | None = None,
     ) -> DebugPatchResult:
         """Return corrected code and compact diagnosis/patch summary."""
-        prompt = f"""You are an expert Python debugger. The following module failed to load or run.
+        retry_context = {
+            "attempt_index": attempt,
+            "recent_patch_summary": recent_patch_summary or "N/A",
+        }
+        prev_failures = [dict(x) for x in (previous_failures or [])]
+        prompt = f"""SYSTEM:
+You are a senior ML engineer debugging generated ML models.
 
+TASK:
+Fix the failing Python module.
+
+INPUT:
 Error:
 {error_message}
 
 Traceback:
 {traceback_text}
 
-Attempt index: {attempt}
-Recent patch summary: {recent_patch_summary or "N/A"}
-
-Spec (must still satisfy):
+Spec:
 {json.dumps(spec.to_prompt_dict(), indent=2)}
 
 Broken code:
@@ -94,13 +102,41 @@ Broken code:
 {broken_code}
 ```
 
-Return ONLY a JSON object with keys:
-- diagnosis: short root-cause diagnosis (1 sentence)
-- patch_summary: concise summary of the concrete fix (1 sentence)
-- code: the complete corrected Python module source
+CONSTRAINTS:
+- Must define class {GENERATED_ESTIMATOR_CLASS_NAME}
+- Must implement fit(self, X, y) and predict(self, X)
+- predict must return 1D numpy array
+- No file I/O, subprocess, eval, or network
+- Preserve original intent and avoid unrelated refactors
+- Avoid adding new dependencies unless strictly necessary
 
-The code MUST define class `{GENERATED_ESTIMATOR_CLASS_NAME}` with fit(self, X, y) and predict(self, X).
-Do not include markdown fences.
+COMMON FAILURE MODES:
+- wrong output shape
+- missing methods
+- wrong task type behavior
+- NaN or invalid outputs
+
+RETRY CONTEXT:
+{json.dumps(retry_context, indent=2)}
+
+PREVIOUS FAILURES:
+{json.dumps(prev_failures, indent=2)}
+
+SELF-CHECK BEFORE OUTPUT:
+- class exists
+- required methods exist
+- output shape is correct
+- output is valid JSON
+- code is full module source (no markdown fences)
+- code is syntactically valid Python
+
+OUTPUT FORMAT:
+Return ONLY JSON:
+{{
+  "diagnosis": "...",
+  "patch_summary": "...",
+  "code": "..."
+}}
 """
         response = self._llm_agent.call_llm(prompt)
         return _parse_debug_response(response)

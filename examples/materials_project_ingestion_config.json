@@ -1,0 +1,21 @@
+{
+  "source": "Materials Project summary API",
+  "chemsys": "Li-Fe-O",
+  "fields": [
+    "material_id",
+    "formula_pretty",
+    "formation_energy_per_atom",
+    "band_gap",
+    "energy_above_hull",
+    "density",
+    "volume",
+    "nsites",
+    "is_stable"
+  ],
+  "target": "formation_energy_per_atom",
+  "limit": 200,
+  "missing_strategy": "impute",
+  "outlier_strategy": "iqr_clip",
+  "scaling": "standard",
+  "output_path": "data/materials_project_li_fe_o_preprocessed.csv"
+}

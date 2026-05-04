@@ -1,5 +1,5 @@
 """
-Week 4: Full ML pipeline example (no API key required).
+Full ML pipeline example (no API key required).
 
 Runs the end-to-end pipeline with a mock LLM to verify:
 - Data ingestion, planning, model selection, training, evaluation, plotting, LLM interpretation.
@@ -45,7 +45,7 @@ or trying ensemble methods like Gradient Boosting for potential improvements."""
 
 
 def main():
-    print("Week 4: Full ML pipeline (mock LLM)")
+    print("Full ML pipeline (mock LLM)")
     print("=" * 50)
 
     agent = MockLLMAgent()

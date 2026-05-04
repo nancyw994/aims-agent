@@ -245,6 +245,15 @@ class CSVDataLoader(DataInterface):
         # Infer features / target
         features, target = _infer_features_and_target(df, config)
 
+        # Validate target column exists before any further processing.
+        if target not in df.columns:
+            close = [c for c in df.columns if target.lower() in c.lower()]
+            hint = f" Did you mean one of: {close}?" if close else ""
+            raise ValueError(
+                f"Target column '{target}' not found in dataset.{hint}\n"
+                f"Available columns: {list(df.columns)}"
+            )
+
         # Missing-data handling should be based on selected features + target only.
         selected_cols = [c for c in [*features, target] if c in df.columns]
         original_df = df.copy()

@@ -3,8 +3,10 @@ import json
 import sys
 
 from aims_agent.agent import Agent
+from aims_agent.report_writer import write_pipeline_report
 from aims_agent.synthetic_loader import SyntheticDataLoader
 from aims_agent.csv_loader import CSVDataLoader
+from aims_agent.matsci_data_ingestor import MaterialsProjectDataIngestor
 from aims_agent.data_interface import get_metadata
 from aims_agent.model_selector import suggest_models, ModelSuggestion, list_all_models, get_model_suggestion
 from aims_agent.task_type_suggest import _heuristic_task_type, suggest_task_type
@@ -206,6 +208,81 @@ Examples:
         action="store_true",
         help="When used with --keep-na, impute missing feature values (numeric: median, categorical: mode).",
     )
+    data_grp.add_argument(
+        "--materials-project",
+        action="store_true",
+        help="Fetch real materials data from the Materials Project summary API instead of using --data/synthetic.",
+    )
+    data_grp.add_argument(
+        "--mp-api-key",
+        default=None,
+        metavar="KEY",
+        help="Materials Project API key. Defaults to MP_API_KEY or MATERIALS_PROJECT_API_KEY.",
+    )
+    data_grp.add_argument(
+        "--mp-chemsys",
+        default=None,
+        metavar="SYSTEM",
+        help="Materials Project chemical system filter, e.g. Li-Fe-O.",
+    )
+    data_grp.add_argument(
+        "--mp-elements",
+        nargs="+",
+        default=None,
+        metavar="EL",
+        help="Materials Project element filter, e.g. Li Fe O.",
+    )
+    data_grp.add_argument(
+        "--mp-material-ids",
+        nargs="+",
+        default=None,
+        metavar="MPID",
+        help="Specific Materials Project IDs, e.g. mp-149 mp-13.",
+    )
+    data_grp.add_argument(
+        "--mp-fields",
+        nargs="+",
+        default=None,
+        metavar="FIELD",
+        help="Materials Project summary fields to request. Defaults to common scalar ML fields.",
+    )
+    data_grp.add_argument(
+        "--mp-limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Limit Materials Project records after query.",
+    )
+    data_grp.add_argument(
+        "--preprocessing-suggestion",
+        default=None,
+        metavar="TEXT",
+        help="Optional LLM/domain guidance for missing values, outliers, and scaling.",
+    )
+    data_grp.add_argument(
+        "--missing-strategy",
+        choices=["drop", "impute"],
+        default=None,
+        help="Real-data missing feature handling. Overrides --preprocessing-suggestion.",
+    )
+    data_grp.add_argument(
+        "--outlier-strategy",
+        choices=["none", "iqr_clip", "iqr_drop"],
+        default=None,
+        help="Real-data outlier handling. Overrides --preprocessing-suggestion.",
+    )
+    data_grp.add_argument(
+        "--scaling",
+        choices=["none", "standard", "minmax"],
+        default=None,
+        help="Real-data feature scaling. Overrides --preprocessing-suggestion.",
+    )
+    data_grp.add_argument(
+        "--preprocessed-output",
+        default=None,
+        metavar="PATH",
+        help="Optional CSV path where preprocessed real materials data is saved.",
+    )
 
     # Task
     task_grp = p.add_argument_group("Task")
@@ -277,7 +354,7 @@ Examples:
     train_grp.add_argument(
         "--use-custom-codegen",
         action="store_true",
-        help="Enable Week-5 custom code generation and execution step.",
+        help="Enable custom code generation and execution step.",
     )
     train_grp.add_argument(
         "--custom-code-request",
@@ -307,6 +384,14 @@ Examples:
         default=2,
         metavar="N",
         help="Max LLM repair rounds after failed load of generated estimator (default: 2).",
+    )
+
+    out_grp = p.add_argument_group("Output")
+    out_grp.add_argument(
+        "--report-dir",
+        default="results",
+        metavar="DIR",
+        help="Directory to save the plain-language pipeline report (default: results).",
     )
 
     return p.parse_args()
@@ -340,7 +425,27 @@ def main():
     agent = Agent()
 
     # Build loader + config 
-    if args.data:
+    if args.materials_project:
+        loader = MaterialsProjectDataIngestor()
+        data_config = {
+            "api_key": args.mp_api_key,
+            "chemsys": args.mp_chemsys,
+            "elements": args.mp_elements,
+            "material_ids": args.mp_material_ids,
+            "fields": args.mp_fields,
+            "limit": args.mp_limit,
+            "target": args.target,
+            "features": args.features,
+            "preprocessing_suggestion": args.preprocessing_suggestion,
+            "output_path": args.preprocessed_output,
+        }
+        if args.missing_strategy:
+            data_config["missing_strategy"] = args.missing_strategy
+        if args.outlier_strategy:
+            data_config["outlier_strategy"] = args.outlier_strategy
+        if args.scaling:
+            data_config["scaling"] = args.scaling
+    elif args.data:
         loader = CSVDataLoader()
         sheet: int | str = int(args.sheet) if args.sheet.isdigit() else args.sheet
         data_config: dict = {
@@ -436,7 +541,10 @@ def main():
     if args.multi_agent and (result.self_correction_summary or result.self_correction_log_path):
         print("\nSelf-correction:")
         print(f"  Attempts     : {result.self_correction_attempts}")
-        print(f"  Success      : {result.self_correction_success}")
+        if result.self_correction_attempts > 0:
+            print(f"  Success      : {result.self_correction_success}")
+        else:
+            print(f"  Success      : N/A (no correction attempted)")
         if result.self_correction_summary:
             print(f"  Summary      : {result.self_correction_summary}")
         if result.self_correction_log_path:
@@ -460,6 +568,13 @@ def main():
     if result.interpretation:
         print("\nLLM interpretation:")
         print(result.interpretation)
+
+    # Write plain-language report
+    try:
+        report_path = write_pipeline_report(result, output_dir=args.report_dir)
+        print(f"\nReport saved: {report_path}")
+    except Exception as exc:
+        print(f"\n[Warning] Could not write report: {exc}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,46 @@
+[
+  {
+    "material_id": "mp-demo-1",
+    "formula_pretty": "LiFeO2",
+    "formation_energy_per_atom": -2.41,
+    "band_gap": 2.15,
+    "energy_above_hull": 0.01,
+    "density": 4.21,
+    "volume": 42.5,
+    "nsites": 4,
+    "is_stable": true
+  },
+  {
+    "material_id": "mp-demo-2",
+    "formula_pretty": "Li2FeO3",
+    "formation_energy_per_atom": -2.68,
+    "band_gap": 1.72,
+    "energy_above_hull": 0.04,
+    "density": 4.08,
+    "volume": 55.1,
+    "nsites": 6,
+    "is_stable": false
+  },
+  {
+    "material_id": "mp-demo-3",
+    "formula_pretty": "Fe2O3",
+    "formation_energy_per_atom": -1.83,
+    "band_gap": 2.05,
+    "energy_above_hull": 0.0,
+    "density": 5.24,
+    "volume": 51.8,
+    "nsites": 5,
+    "is_stable": true
+  },
+  {
+    "material_id": "mp-demo-4",
+    "formula_pretty": "Li5FeO4",
+    "formation_energy_per_atom": -2.22,
+    "band_gap": null,
+    "energy_above_hull": 0.12,
+    "density": 3.74,
+    "volume": 66.3,
+    "nsites": 10,
+    "is_stable": false
+  }
+]

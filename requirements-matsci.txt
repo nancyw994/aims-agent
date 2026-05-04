@@ -1,0 +1,9 @@
+# Optional real Materials Project ingestion dependencies.
+# Install only when fetching live Materials Project data:
+#   pip install -r requirements-matsci.txt
+
+-r requirements.txt
+mp-api>=0.41.0
+
+# Optional structure handling for MatSci-specific formats.
+pymatgen>=2024.5.1

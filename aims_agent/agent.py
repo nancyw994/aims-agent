@@ -54,6 +54,10 @@ class PipelineResult:
     self_correction_success: bool = False
     self_correction_log_path: str = ""
     self_correction_summary: str = ""
+    self_correction_report: dict = field(default_factory=dict)
+    # Report-level context
+    motivation: str = ""
+    task_type: str = ""
 
 
 class Agent:
@@ -75,6 +79,12 @@ class Agent:
 
     def retrieve_data(self, interface: DataInterface, config: Mapping[str, Any]) -> DatasetBundle:
         return interface.load_dataset(config)
+
+    def retrieve_real_materials_data(self, config: Mapping[str, Any]) -> DatasetBundle:
+        """Load real materials data through the Materials Project/local MatSci ingestor."""
+        from aims_agent.matsci_data_ingestor import MaterialsProjectDataIngestor
+
+        return self.retrieve_data(MaterialsProjectDataIngestor(), config)
 
     def select_model_and_ensure_deps(
         self,
@@ -144,6 +154,8 @@ class Agent:
             PipelineResult with steps, metrics, plot path, and LLM interpretation.
         """
         result = PipelineResult()
+        result.motivation = motivation
+        result.task_type = task_type
 
         try:
             # Step 1: Data ingestion
@@ -383,6 +395,11 @@ class Agent:
                         result.self_correction_success = mcr.self_correction_success
                         result.self_correction_log_path = mcr.self_correction_log_path
                         result.self_correction_summary = mcr.self_correction_summary
+                        if mcr.self_correction_log_path:
+                            from aims_agent.self_correction_report import aggregate_self_correction_logs
+                            result.self_correction_report = aggregate_self_correction_logs(
+                                mcr.self_correction_log_path
+                            )
                         result.training_validation_ok = tpr.training_validation_ok
                         result.training_validation_message = (
                             f"[{tpr.training_validation_code}] {tpr.training_validation_message}"

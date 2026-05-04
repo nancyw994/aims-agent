@@ -1,6 +1,6 @@
 # aims-agent
 
-AI Agent for ML in Materials Science. Week 2 delivers a **standardized data ingestion interface**: real MatSci datasets are not yet integrated, but the architecture supports future replacement with literature-extracted datasets, experimental CSVs, database APIs, and structured MatSci repositories. The system remains **modular and forward-compatible**.
+AI Agent for ML in Materials Science. The project provides a **standardized data ingestion interface**: real MatSci datasets can be loaded through CSV/JSON files or external data sources, while the architecture supports future replacement with literature-extracted datasets, experimental CSVs, database APIs, and structured MatSci repositories. The system remains **modular and forward-compatible**.
 
 ---
 
@@ -31,7 +31,7 @@ AI Agent for ML in Materials Science. Week 2 delivers a **standardized data inge
 
 ---
 
-## Week 3: Model selection & dependency management
+## Model Selection & Dependency Management
 
 - **`model_selector.py`** — `suggest_model(agent, features, target)` asks the LLM (via the Agent) for a model name and Python package (e.g. `RandomForestRegressor`, `scikit-learn`). The LLM must return both in the format `MODEL: ...` / `PACKAGE: ...`.
 - **`dependency_manager.py`** — `ensure_package_installed(package_name)` checks if the package is importable; if not, runs `pip install <package>` in a subprocess. Installation failures are logged to `logs/dependency_install.log`.
@@ -59,12 +59,12 @@ PACKAGE: xgboost
 To try multiple scenarios without using the API, run the demo script:
 
 ```bash
-python examples/week3_model_selection_examples.py
+python examples/model_selection_examples.py
 ```
 
 ---
 
-## Week 4: Training & results analysis
+## Training & Results Analysis
 
 - **`model_trainer.py`** — `ModelTrainer(model_class, hyperparams?)` prepares train/test split, trains the model (optionally with `GridSearchCV`), and returns `(y_true, y_pred)` from `predict()`.
 - **`results_analyzer.py`** — `compute_metrics(y_true, y_pred)` (R2, MSE, RMSE, MAE); `plot_results(...)` saves predicted-vs-actual and residual plots to `results/`; `interpret_with_llm(agent, metrics, model_name)` asks the LLM to interpret the metrics.
@@ -95,3 +95,73 @@ Execution order:
 3. Only if both paths are unavailable or fail, trigger CodeGen for that same selected model.
 
 In other words, if a selected model already has a working builtin/dynamic path, CodeGen is not called.
+
+---
+
+## Real MatSci Data Ingestion
+
+- **`matsci_data_ingestor.py`** — `MaterialsProjectDataIngestor` loads local CSV/JSON materials exports or fetches live Materials Project summary data through the optional `mp-api` client.
+- **Preprocessing** — Missing feature values can be dropped or imputed; outliers can be ignored, IQR-clipped, or IQR-dropped; numeric features can be left raw, standardized, or min-max scaled. A limited `preprocessing_suggestion` parser maps simple LLM guidance onto those deterministic operations.
+- **Agent integration** — `Agent.retrieve_real_materials_data(config)` and the CLI `--materials-project` path use the same `DataInterface` contract as synthetic and CSV data.
+- **Reproducibility** — `scripts/ingest_materials_project.py` runs from JSON config and can save a preprocessed CSV.
+
+Install optional live-ingestion dependencies:
+
+```bash
+pip install -r requirements-matsci.txt
+```
+
+Run a live Materials Project query:
+
+```bash
+export MP_API_KEY="..."
+python scripts/ingest_materials_project.py \
+  --config examples/materials_project_ingestion_config.json
+```
+
+Run the offline local-export example:
+
+```bash
+python scripts/ingest_materials_project.py \
+  --config examples/local_matsci_ingestion_config.json
+```
+
+Use live Materials Project data in the full agent pipeline:
+
+```bash
+python -m aims_agent.cli \
+  --materials-project \
+  --mp-chemsys Li-Fe-O \
+  --mp-limit 200 \
+  --target formation_energy_per_atom \
+  --scaling standard \
+  --preprocessed-output data/materials_project_li_fe_o_preprocessed.csv \
+  --motivation "Predict formation energy from Materials Project summary descriptors"
+```
+
+---
+
+## LLM-Driven Data Analysis & Strategy
+
+- **`data_analyzer.py`** — Builds a real-data profile with descriptive statistics, missingness, skewness, IQR outlier checks, target correlations, and high feature-feature correlations.
+- **Plots** — Saves histograms, a numeric correlation heatmap, and target relationship scatter plots.
+- **Strategy formulation** — Creates a new run folder under `results/` for every execution and writes `strategy.json`, `strategy_report.md`, and all plots there. With an LLM-enabled `Agent`, the strategy prompt includes schema, statistics, risk flags, and plot references. With `--no-llm`, it writes a deterministic heuristic strategy.
+
+Run against the Materials Project output:
+
+```bash
+python scripts/analyze_matsci_strategy.py \
+  --no-llm \
+  --data data/materials_project_li_fe_o_preprocessed.csv \
+  --target formation_energy_per_atom \
+  --output-dir results
+```
+
+Outputs:
+
+- `results/run_*/profile.json`
+- `results/run_*/strategy.json`
+- `results/run_*/strategy_report.md`
+- `results/run_*/histograms.png`
+- `results/run_*/correlation_heatmap.png`
+- `results/run_*/target_relationshi

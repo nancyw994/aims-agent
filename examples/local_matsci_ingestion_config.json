@@ -1,0 +1,9 @@
+{
+  "path": "data/example_materials_project_summary.json",
+  "source": "Local Materials Project summary export example",
+  "target": "formation_energy_per_atom",
+  "missing_strategy": "impute",
+  "outlier_strategy": "iqr_clip",
+  "scaling": "standard",
+  "output_path": "data/example_materials_project_preprocessed.csv"
+}

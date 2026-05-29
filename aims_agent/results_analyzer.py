@@ -151,14 +151,51 @@ def interpret_with_llm(
     model_name: str,
     task_type: Literal["regression", "classification"] = "regression",
     background_knowledge: str | None = None,
+    uncertainty_metrics: dict | None = None,
 ) -> str:
-    """Ask the LLM to interpret the metrics in 2–3 short paragraphs."""
+    """
+    Ask the LLM to interpret the metrics in 2–3 short paragraphs.
+
+    Args:
+        agent: Agent instance for LLM calls
+        metrics: Performance metrics (R2, RMSE, MAE, etc.)
+        model_name: Name of the model
+        task_type: "regression" or "classification"
+        background_knowledge: Optional domain context
+        uncertainty_metrics: Optional uncertainty quantification metrics from uncertainty-toolbox
+    """
     task_desc = "classification" if task_type == "classification" else "regression"
-    prompt = f"""As a materials science ML expert, interpret this model evaluation:
+    prompt = f"""As a ML expert, interpret this model evaluation with uncertainty quantification:
 
 Model: {model_name}
 Task: {task_desc}
-Metrics: {metrics}
+Metrics: {metrics}"""
+
+    # Add uncertainty quantification information if available
+    if uncertainty_metrics:
+        accuracy = uncertainty_metrics.get('accuracy', {})
+        calibration = uncertainty_metrics.get('avg_calibration', {})
+        sharpness = uncertainty_metrics.get('sharpness', {})
+        scoring = uncertainty_metrics.get('scoring_rule', {})
+
+        prompt += f"""
+
+Uncertainty Quantification (from uncertainty-toolbox):
+- Calibration Error (MAE): {calibration.get('ma_cal', 'N/A')} (lower is better; well-calibrated if < 0.1)
+- Root Mean Squared Calibration Error: {calibration.get('rms_cal', 'N/A')}
+- Average Prediction Uncertainty: {sharpness.get('sharpness', 'N/A')} (sharpness measure)
+- Negative Log-Likelihood: {scoring.get('nll', 'N/A')} (lower is better)
+- CRPS: {scoring.get('crps', 'N/A')} (continuous ranked probability score; lower is better)"""
+    if uncertainty_metrics:
+        prompt += """
+In 3–4 short paragraphs:
+1. How good is this performance (good / moderate / poor)?
+2. What do these metrics mean for materials property prediction?
+3. **Uncertainty Assessment**: Are the predictions well-calibrated? Can we trust the uncertainty estimates? Which predictions are safe to use vs need experimental validation?
+4. **Active Learning Recommendation**: Should we prioritize high-uncertainty samples or diverse sampling for the next experiments?
+5. One concrete improvement suggestion for both accuracy and uncertainty quantification."""
+    else:
+        prompt += """
 
 In 2–3 short paragraphs:
 1. How good is this performance (good / moderate / poor)?

@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 
 from aims_agent.data_interface import DatasetBundle, get_metadata
+from aims_agent.distribution import plot_distribution
 
 
 @dataclass
@@ -49,6 +50,7 @@ class DataProfile:
     correlations: dict[str, Any]
     risks: list[str] = field(default_factory=list)
     plot_paths: list[str] = field(default_factory=list)
+    distribution_plot_path: str = ""
     summary_text: str = ""
 
 
@@ -64,6 +66,8 @@ class StrategyArtifact:
     llm_interpretation: str
     profile_path: str
     plot_paths: list[str]
+    uncertainty_strategy: list[str] = field(default_factory=list)
+    active_learning_plan: list[str] = field(default_factory=list)
     run_context: dict[str, Any] = field(default_factory=dict)
 
 
@@ -118,17 +122,65 @@ MODEL_INFO: dict[str, dict[str, str]] = {
     },
 }
 
+MODEL_FIT_NOTES: dict[str, dict[str, str]] = {
+    "Ridge": {
+        "regression": "Best when sample size is modest and descriptors are correlated; stable baseline for skewed tabular data after scaling.",
+        "classification": "Not applicable.",
+    },
+    "ElasticNet": {
+        "regression": "Best when a few descriptors are correlated and you want shrinkage plus automatic feature suppression.",
+        "classification": "Not applicable.",
+    },
+    "Lasso": {
+        "regression": "Best when only a few descriptors are expected to matter and you want sparse coefficients; weaker when predictors are highly correlated.",
+        "classification": "Not applicable.",
+    },
+    "RandomForestRegressor": {
+        "regression": "Best when you expect nonlinear interactions and want a robust low-tuning benchmark; less ideal for extrapolation.",
+        "classification": "Not applicable.",
+    },
+    "GradientBoostingRegressor": {
+        "regression": "Best when moderate sample size supports learning nonlinear corrections around a strong baseline.",
+        "classification": "Not applicable.",
+    },
+    "SVR": {
+        "regression": "Best for small-to-medium tabular regression with smooth nonlinear structure after scaling.",
+        "classification": "Not applicable.",
+    },
+    "LogisticRegression": {
+        "regression": "Not applicable.",
+        "classification": "Best when class boundaries are close to linear and interpretability matters.",
+    },
+    "RandomForestClassifier": {
+        "regression": "Not applicable.",
+        "classification": "Best when mixed interactions and nonlinear boundaries matter more than coefficients.",
+    },
+    "GradientBoostingClassifier": {
+        "regression": "Not applicable.",
+        "classification": "Best when the dataset is modest in size and nonlinear class structure is likely.",
+    },
+    "SVC": {
+        "regression": "Not applicable.",
+        "classification": "Best for small-to-medium datasets with clear margins after scaling.",
+    },
+    "ExtraTreesClassifier": {
+        "regression": "Not applicable.",
+        "classification": "Best when a strong ensemble baseline is needed and noise is present.",
+    },
+}
+
 DEFAULT_MODEL_POOLS: dict[str, list[str]] = {
     "regression": [
-        "RandomForestRegressor",
         "Ridge",
         "ElasticNet",
+        "RandomForestRegressor",
         "GradientBoostingRegressor",
         "SVR",
+        "Lasso",
     ],
     "classification": [
-        "RandomForestClassifier",
         "LogisticRegression",
+        "RandomForestClassifier",
         "GradientBoostingClassifier",
         "SVC",
         "ExtraTreesClassifier",
@@ -339,6 +391,227 @@ def _normalize_models(models: list[str], task_type: str, *, target_count: int = 
     return normalized[:target_count]
 
 
+def _profile_fit_signals(profile: DataProfile) -> dict[str, float]:
+    target_corrs = profile.correlations.get("target_correlations", {})
+    abs_corrs = [abs(v) for v in target_corrs.values()]
+    high_pairs = profile.correlations.get("high_feature_correlations", [])
+    skewed_features = [
+        fp for fp in profile.feature_profiles
+        if fp.skewness is not None and abs(fp.skewness) > 1
+    ]
+    return {
+        "n_rows": float(profile.row_count),
+        "n_features": float(len(profile.feature_profiles)),
+        "target_skew": float(abs(profile.target_profile.skewness or 0.0)),
+        "mean_abs_target_corr": float(np.mean(abs_corrs)) if abs_corrs else 0.0,
+        "max_abs_target_corr": float(max(abs_corrs)) if abs_corrs else 0.0,
+        "high_corr_pairs": float(len(high_pairs)),
+        "high_skew_features": float(len(skewed_features)),
+        "has_high_collinearity": float(bool(high_pairs)),
+    }
+
+
+def _score_regression_model(model: str, profile: DataProfile, signals: Mapping[str, float]) -> tuple[float, str]:
+    n_rows = signals["n_rows"]
+    n_features = signals["n_features"]
+    target_skew = signals["target_skew"]
+    mean_abs_corr = signals["mean_abs_target_corr"]
+    max_abs_corr = signals["max_abs_target_corr"]
+    high_corr_pairs = signals["high_corr_pairs"]
+    high_skew_features = signals["high_skew_features"]
+    collinear = high_corr_pairs > 0
+    small_data = n_rows < 300
+
+    if model == "Ridge":
+        score = 92.0
+        if collinear:
+            score += 18.0
+        if small_data:
+            score += 8.0
+        if mean_abs_corr >= 0.15:
+            score += 4.0
+        if target_skew > 1:
+            score += 2.0
+        reason = (
+            "Strong fit because the data are small, several descriptors are correlated, "
+            "and Ridge tolerates multicollinearity while staying stable after scaling."
+        )
+        return score, reason
+
+    if model == "ElasticNet":
+        score = 88.0
+        if collinear:
+            score += 16.0
+        if n_features >= 5:
+            score += 4.0
+        if small_data:
+            score += 6.0
+        if high_skew_features > 0:
+            score += 2.0
+        reason = (
+            "Strong fit because correlated descriptors suggest shrinkage plus some feature "
+            "suppression is useful, but the sample size is still small enough to keep the "
+            "linear bias manageable."
+        )
+        return score, reason
+
+    if model == "Lasso":
+        score = 64.0
+        if n_features >= 10:
+            score += 8.0
+        if collinear:
+            score -= 12.0
+        if small_data:
+            score += 3.0
+        reason = (
+            "Moderate fit because it can drop weak descriptors, but it is less stable than "
+            "ElasticNet when predictors are correlated."
+        )
+        return score, reason
+
+    if model == "RandomForestRegressor":
+        score = 80.0
+        if high_skew_features > 0:
+            score += 10.0
+        if max_abs_corr >= 0.3:
+            score += 6.0
+        if n_rows < 80:
+            score -= 6.0
+        if collinear:
+            score += 4.0
+        reason = (
+            "Good fit because tree ensembles handle nonlinear feature interactions and are "
+            "less sensitive to skew than linear models, while still giving a strong baseline."
+        )
+        return score, reason
+
+    if model == "GradientBoostingRegressor":
+        score = 84.0
+        if mean_abs_corr >= 0.1:
+            score += 6.0
+        if max_abs_corr >= 0.3:
+            score += 8.0
+        if n_rows >= 100:
+            score += 8.0
+        if target_skew > 1:
+            score += 4.0
+        if n_rows < 60:
+            score -= 8.0
+        reason = (
+            "Good fit because boosting can capture smoother nonlinear corrections that may "
+            "exist beyond the linear signal, but it still benefits from a moderate sample size."
+        )
+        return score, reason
+
+    if model == "SVR":
+        score = 76.0
+        if n_rows <= 1000:
+            score += 10.0
+        if n_features <= 20:
+            score += 4.0
+        if target_skew > 1:
+            score -= 2.0
+        if collinear:
+            score += 2.0
+        reason = (
+            "Good fit because the dataset is small enough for kernel methods and the "
+            "features are standardized, making a smooth nonlinear margin-based model plausible."
+        )
+        return score, reason
+
+    score = 50.0
+    reason = "Fallback candidate."
+    return score, reason
+
+
+def _score_classification_model(model: str, profile: DataProfile, signals: Mapping[str, float]) -> tuple[float, str]:
+    n_rows = signals["n_rows"]
+    n_features = signals["n_features"]
+    high_corr_pairs = signals["high_corr_pairs"]
+    collinear = high_corr_pairs > 0
+    small_data = n_rows < 500
+
+    if model == "LogisticRegression":
+        score = 88.0
+        if collinear:
+            score += 12.0
+        if small_data:
+            score += 8.0
+        reason = (
+            "Strong fit because a linear classifier is usually the safest first choice when "
+            "sample size is limited and interpretability matters."
+        )
+        return score, reason
+    if model == "RandomForestClassifier":
+        score = 82.0
+        if collinear:
+            score += 6.0
+        if small_data:
+            score += 4.0
+        reason = (
+            "Good fit because tree ensembles capture nonlinear boundaries and tolerate "
+            "mixed feature scales without much manual preprocessing."
+        )
+        return score, reason
+    if model == "GradientBoostingClassifier":
+        score = 80.0
+        if small_data:
+            score += 6.0
+        if n_features >= 5:
+            score += 4.0
+        reason = (
+            "Good fit because boosting can refine decision boundaries on modest tabular data."
+        )
+        return score, reason
+    if model == "SVC":
+        score = 78.0
+        if n_rows <= 1000:
+            score += 8.0
+        if n_features <= 20:
+            score += 4.0
+        reason = (
+            "Good fit because margin-based kernels work well on small tabular problems after scaling."
+        )
+        return score, reason
+    if model == "ExtraTreesClassifier":
+        score = 77.0
+        if collinear:
+            score += 5.0
+        reason = (
+            "Good fit because extremely randomized trees are robust to noise and nonlinear interactions."
+        )
+        return score, reason
+    return 50.0, "Fallback candidate."
+
+
+def _score_model_fit(model: str, profile: DataProfile) -> tuple[float, str]:
+    signals = _profile_fit_signals(profile)
+    if profile.task_type == "classification":
+        return _score_classification_model(model, profile, signals)
+    return _score_regression_model(model, profile, signals)
+
+
+def _recommend_models_from_profile(
+    profile: DataProfile,
+    *,
+    llm_models: list[str] | None = None,
+    target_count: int = 5,
+) -> list[str]:
+    candidate_pool = list(DEFAULT_MODEL_POOLS.get(profile.task_type, []))
+    if llm_models:
+        for model in llm_models:
+            if model not in candidate_pool:
+                candidate_pool.append(model)
+
+    scored: list[tuple[float, str, str]] = []
+    for model in candidate_pool:
+        score, reason = _score_model_fit(model, profile)
+        scored.append((score, model, reason))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [model for _, model, _ in scored[:target_count]]
+
+
 def _format_run_context(run_context: Mapping[str, Any] | None) -> str:
     if not run_context:
         return (
@@ -402,6 +675,15 @@ def profile_dataset(
         target_correlations=correlations.get("target_correlations", {}),
         max_scatter_features=max_scatter_features,
     )
+    distribution_plot_path = plot_distribution(
+        df,
+        features,
+        target,
+        task_type=task_type,
+        save_dir=output_dir,
+    )
+    if distribution_plot_path not in plot_paths:
+        plot_paths = [distribution_plot_path, *plot_paths]
 
     profile = DataProfile(
         metadata=metadata,
@@ -413,6 +695,7 @@ def profile_dataset(
         correlations=correlations,
         risks=risks,
         plot_paths=plot_paths,
+        distribution_plot_path=distribution_plot_path,
     )
     profile.summary_text = _format_profile_summary(profile)
     return profile
@@ -519,21 +802,28 @@ def generate_profile_plots(
 def build_strategy_prompt(profile: DataProfile) -> str:
     """Build the LLM prompt from schema, stats, risks, and plot references."""
 
-    return f"""You are a materials science machine-learning lead.
+    return f"""You are a materials science machine-learning lead with expertise in uncertainty quantification and active learning.
 
-Analyze this real MatSci dataset profile and formulate an ML strategy.
+Analyze this real MatSci dataset profile and formulate an ML strategy that considers prediction reliability and experimental efficiency.
 
 Dataset schema and profile:
 {profile.summary_text}
+
+IMPORTANT: Consider uncertainty quantification and active learning in your recommendations.
+- Prefer ensemble models (RandomForest, GradientBoosting) for uncertainty estimates
+- Plan for prediction reliability assessment and active learning loops
+- Consider which predictions will need experimental validation
 
 Return ONLY valid JSON with these keys:
 {{
   "key_features": ["feature names and why they matter"],
   "risks": ["correlation, skewness, missingness, leakage, small-data, or domain risks"],
   "preprocessing": ["recommended preprocessing steps"],
-  "recommended_models": ["model classes or model families"],
-  "validation_plan": ["cross-validation, holdout, metrics, sanity checks"],
-  "scientific_rationale": "short paragraph tying recommendations to materials science"
+  "recommended_models": ["model classes or model families - prefer ensembles for uncertainty"],
+  "uncertainty_strategy": ["how to estimate and use prediction uncertainty; which samples need validation"],
+  "active_learning_plan": ["strategy for selecting next experiments: uncertainty-based, diversity-based, or hybrid"],
+  "validation_plan": ["cross-validation, holdout, metrics, calibration checks, uncertainty evaluation"],
+  "scientific_rationale": "short paragraph tying recommendations to materials science and explaining the uncertainty-aware approach"
 }}
 
 Be concrete. Refer to the plot filenames when useful, but do not invent plots."""
@@ -574,8 +864,8 @@ def formulate_strategy(
 
     if profile.task_type == "classification":
         recommended_models = [
-            "RandomForestClassifier",
             "LogisticRegression",
+            "RandomForestClassifier",
             "GradientBoostingClassifier",
             "SVC",
             "ExtraTreesClassifier",
@@ -583,9 +873,9 @@ def formulate_strategy(
         validation_plan = ["Use stratified train/test split or StratifiedKFold.", "Report accuracy, macro F1, and confusion matrix."]
     else:
         recommended_models = [
-            "RandomForestRegressor",
             "Ridge",
             "ElasticNet",
+            "RandomForestRegressor",
             "GradientBoostingRegressor",
             "SVR",
         ]
@@ -599,6 +889,18 @@ def formulate_strategy(
     if any("outliers" in r for r in profile.risks):
         preprocessing.append("Inspect IQR outliers before choosing clip, drop, or robust models.")
 
+    # Default uncertainty and active learning strategies
+    uncertainty_strategy = [
+        "Use ensemble models (RandomForest, GradientBoosting) to estimate prediction uncertainty from variance across estimators.",
+        "Evaluate calibration using uncertainty-toolbox metrics (calibration error, sharpness, NLL).",
+        "Flag predictions with high uncertainty (e.g., std > threshold) for experimental validation."
+    ]
+    active_learning_plan = [
+        "Start with uncertainty sampling: select top-N samples with highest prediction uncertainty.",
+        "After first batch, consider diversity sampling to improve feature space coverage.",
+        "Retrain model after each experimental batch to refine uncertainty estimates."
+    ]
+
     llm_text = ""
     llm_json: dict[str, Any] | None = None
     if use_llm and agent is not None:
@@ -606,17 +908,24 @@ def formulate_strategy(
         llm_json = _extract_json_object(llm_text)
 
     if llm_json:
-        recommended_models = [str(x) for x in llm_json.get("recommended_models", recommended_models)]
+        llm_models = [str(x) for x in llm_json.get("recommended_models", [])]
         preprocessing = [str(x) for x in llm_json.get("preprocessing", preprocessing)]
         validation_plan = [str(x) for x in llm_json.get("validation_plan", validation_plan)]
         feature_guidance = [str(x) for x in llm_json.get("key_features", feature_guidance)]
+        uncertainty_strategy = [str(x) for x in llm_json.get("uncertainty_strategy", uncertainty_strategy)]
+        active_learning_plan = [str(x) for x in llm_json.get("active_learning_plan", active_learning_plan)]
         llm_text = str(llm_json.get("scientific_rationale", llm_text)).strip()
         risks = [str(x) for x in llm_json.get("risks", profile.risks)]
     else:
         risks = profile.risks
         llm_text = llm_text or "Offline heuristic strategy generated from profile statistics."
+        llm_models = []
 
-    recommended_models = _normalize_models(recommended_models, profile.task_type, target_count=5)
+    recommended_models = _recommend_models_from_profile(
+        profile,
+        llm_models=llm_models if llm_json else None,
+        target_count=5,
+    )
 
     profile_path = str(Path(output_dir) / "profile.json")
     return StrategyArtifact(
@@ -630,6 +939,8 @@ def formulate_strategy(
         llm_interpretation=llm_text,
         profile_path=profile_path,
         plot_paths=profile.plot_paths,
+        uncertainty_strategy=uncertainty_strategy,
+        active_learning_plan=active_learning_plan,
         run_context=dict(run_context or {}),
     )
 
@@ -640,13 +951,13 @@ def write_profile_outputs(
     *,
     output_dir: str | Path = "results/data_profile",
 ) -> dict[str, str]:
-    """Write profile JSON, strategy JSON, and a Markdown strategy report."""
+    """Write profile JSON, strategy JSON, and an HTML strategy report."""
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     profile_path = output_dir / "profile.json"
     strategy_path = output_dir / "strategy.json"
-    report_path = output_dir / "strategy_report.md"
+    report_path = output_dir / "strategy_report.html"
 
     profile_data = asdict(profile)
     profile_data["summary_text"] = profile.summary_text
@@ -672,10 +983,11 @@ def write_profile_outputs(
         "## Dataset Summary",
         "",
         _format_dataset_summary(profile),
+        *[f"- {item}" for item in _dataset_summary_bullets(profile)],
         "",
         "## User Inputs",
         "",
-        _format_run_context(strategy.run_context),
+        *[f"- {item}" for item in _user_input_bullets(strategy.run_context)],
         "",
         "## Task Type",
         "",
@@ -696,10 +1008,12 @@ def write_profile_outputs(
         "## Feature Summaries",
         "",
         _format_feature_summary_reason(profile),
+        *[f"- {item}" for item in _feature_summary_bullets(profile)],
         "",
         "## Data Distribution",
         "",
         _format_data_distribution(profile),
+        *[f"- {item}" for item in _data_distribution_bullets(profile)],
         "",
         _feature_guidance_explanation(profile, strategy),
         "",
@@ -725,14 +1039,12 @@ def write_profile_outputs(
         "",
         _model_selection_reason(profile, strategy.recommended_models),
         "",
-        _render_model_table(strategy.recommended_models),
+        _render_model_table(profile, strategy.recommended_models),
         "",
         "The report recommends five model families so the comparison covers linear, "
         "regularized, ensemble, and nonlinear options instead of a single model type.",
         "",
         "Why these models instead of others:",
-        "",
-        _model_selection_reason(profile, strategy.recommended_models),
         "",
         f"Final model choice reasoning: {_model_final_choice_reason(profile, strategy.recommended_models)}",
         "",
@@ -744,6 +1056,30 @@ def write_profile_outputs(
         "",
         "## Validation Plan Items",
         *[f"- {item}" for item in strategy.validation_plan],
+        "",
+        "## Uncertainty Quantification Strategy",
+        "",
+        "**Prediction Reliability Assessment:**",
+        "",
+        "Uncertainty quantification (UQ) helps identify which predictions are reliable and which need experimental validation. "
+        "Ensemble models (RandomForest, GradientBoosting) provide uncertainty estimates through variance across estimators. "
+        "Use the `uncertainty-toolbox` library to compute calibration metrics, sharpness, and proper scoring rules.",
+        "",
+        "**Implementation Steps:**",
+        *[f"- {item}" for item in strategy.uncertainty_strategy],
+        "",
+        "## Active Learning Plan",
+        "",
+        "**Experimental Efficiency:**",
+        "",
+        "Active learning strategically selects the most informative samples for experimental validation, "
+        "maximizing model improvement with minimal experiments. Two main strategies:",
+        "",
+        "- **Uncertainty Sampling**: Prioritize high-uncertainty predictions to reduce model uncertainty",
+        "- **Diversity Sampling**: Select diverse samples to improve feature space coverage",
+        "",
+        "**Recommended Approach:**",
+        *[f"- {item}" for item in strategy.active_learning_plan],
         "",
         "## Risks",
         *[f"- {item}" for item in strategy.risks],
@@ -757,17 +1093,7 @@ def write_profile_outputs(
         "## Supporting Plots",
     ]
     for path in strategy.plot_paths:
-        title = _plot_display_name(path)
-        report_lines.extend(
-            [
-                f"### {title}",
-                "",
-                f"![{title}]({Path(path).name})",
-                "",
-                _plot_description(path, profile),
-                "",
-            ]
-        )
+        report_lines.extend(_render_plot_figure(path, profile))
     report_lines.extend(
         [
             "## Appendix: Feature Statistics",
@@ -796,7 +1122,8 @@ def write_profile_outputs(
                 report_lines.extend(["```text", snippet, "```", ""])
     else:
         report_lines.append("No retry or self-correction reports were generated for this run.")
-    report_path.write_text("\n".join(report_lines), encoding="utf-8")
+    report_html = _render_report_html("\n".join(report_lines), title="MatSci ML Strategy")
+    report_path.write_text(report_html, encoding="utf-8")
     return {
         "run_dir": str(output_dir),
         "profile": str(profile_path),
@@ -821,30 +1148,257 @@ def _plot_display_name(path: str) -> str:
 
 def _plot_description(path: str, profile: DataProfile) -> str:
     stem = Path(path).stem
-    if stem == "histograms":
+    if stem == "data_distribution":
+        target = profile.metadata.get("target", "the target")
+        target_skew = profile.target_profile.skewness if profile.target_profile.skewness is not None else 0.0
+        top_corr = list(profile.correlations.get("target_correlations", {}).items())[:5]
+        corr_text = ", ".join(f"{name} ({value:+.3f})" for name, value in top_corr) if top_corr else "none"
+        skewed_features = [
+            fp.name for fp in profile.feature_profiles
+            if fp.skewness is not None and abs(fp.skewness) > 1
+        ]
+        skew_text = ", ".join(skewed_features) if skewed_features else "none"
         return (
-            "This figure shows the marginal distributions of the target and the main "
-            "descriptors. It helps identify skew, truncated ranges, and variables that "
-            "may benefit from a transform or robust scaling before modeling."
+            "This figure summarizes the distribution of the target and the main descriptors "
+            "in one place, making it easy to see balance, spread, and skew before modeling. "
+            f"The target ({target}) is concentrated around its mean but has a long right tail "
+            f"(skewness = {target_skew:.3f}), so the learning problem is not symmetric. "
+            f"The strongest linear relationships are {corr_text}, and the skewed features are "
+            f"{skew_text}. This tells us whether transformation, scaling, or robust modeling "
+            "choices are likely to help before fitting a predictor."
+        )
+    if stem == "histograms":
+        target = profile.metadata.get("target", "the target")
+        target_skew = profile.target_profile.skewness if profile.target_profile.skewness is not None else 0.0
+        return (
+            f"This figure shows the marginal distributions of the target ({target}) and "
+            "the main descriptors. In this dataset the target is concentrated in a narrow "
+            f"negative band around its mean, with a long right tail and a skewness of "
+            f"{target_skew}, so the property is not symmetrically distributed. The feature "
+            "histograms show that band_gap, volume, and energy_above_hull are also skewed, "
+            "while is_stable behaves like a near-binary indicator after preprocessing, which "
+            "creates a sharp spike rather than a smooth distribution. This tells us the model "
+            "will likely benefit from scaling or transformation for the skewed descriptors, "
+            "and that a simple Gaussian assumption would be a poor fit for this dataset."
         )
     if stem == "correlation_heatmap":
+        high_pairs = profile.correlations.get("high_feature_correlations", [])
+        pair_text = (
+            f" Notable collinear pairs include "
+            + ", ".join(
+                f"{pair['left']} vs {pair['right']} ({pair['correlation']:+.3f})"
+                for pair in high_pairs[:3]
+            )
+            + "."
+            if high_pairs
+            else ""
+        )
         return (
             "This heatmap summarizes linear relationships among the numeric descriptors. "
-            "Strong blocks suggest collinearity, which can inflate variance in linear "
-            "models and motivate regularization or feature reduction."
+            "Dark red and dark blue blocks mean two variables move together or in opposite "
+            "directions strongly enough to matter for modeling. In this dataset the strongest "
+            "signal is the near-duplicate relationship between volume and nsites, which means "
+            "those two descriptors carry overlapping structural information. The heatmap also "
+            "shows that energy_above_hull has the clearest positive relationship with the "
+            "target, while band_gap leans negative and density is weaker." + pair_text + " "
+            "This tells us the dataset has real signal but also redundancy, so linear models "
+            "need regularization or feature selection, and tree-based models are useful as a "
+            "robust check against collinearity."
         )
     if stem == "target_relationships":
         target = profile.metadata.get("target", "the target")
+        top_corr = list(profile.correlations.get("target_correlations", {}).items())[:3]
+        corr_text = ", ".join(f"{name} ({value:+.3f})" for name, value in top_corr) if top_corr else "no strong linear signal"
         return (
             f"These scatter plots compare each key feature against {target}. They show "
             "whether the target behaves linearly, whether the relationship is noisy, and "
-            "whether a non-linear model family may be a better fit than a simple baseline."
+            f"whether the strongest direct signals are {corr_text}. In this dataset, "
+            "energy_above_hull shows the clearest upward trend, which is why it stands out as "
+            "the strongest linear predictor. band_gap and nsites have visible but noisier "
+            "structure, meaning they probably matter but not in a purely linear way. density "
+            "has a gentler positive pattern, and is_stable forms a split cloud because it is "
+            "effectively an indicator variable after preprocessing. Overall, this plot says the "
+            "problem is learnable, but the relationships are mixed enough that a flexible model "
+            "is needed to capture the full pattern rather than relying on a single straight-line "
+            "fit."
         )
     return (
         "This plot is included as supporting evidence for the modeling strategy. It "
         "complements the tabular profile and helps explain the statistical risks behind "
         "the recommendation."
     )
+
+
+def _render_plot_figure(path: str, profile: DataProfile) -> list[str]:
+    title = _plot_display_name(path)
+    description = _plot_description(path, profile)
+    filename = Path(path).name
+    return [
+        f"### {title}",
+        "",
+        f'<figure><img src="{filename}" alt="{title}" style="max-width:100%;height:auto;"><figcaption>{description}</figcaption></figure>',
+        "",
+    ]
+
+
+def _render_report_html(text: str, *, title: str) -> str:
+    from html import escape
+
+    lines = text.splitlines()
+    html_lines: list[str] = [
+        "<!doctype html>",
+        "<html lang=\"en\">",
+        "<head>",
+        "<meta charset=\"utf-8\">",
+        f"<title>{escape(title)}</title>",
+        "<style>",
+        ":root{--bg:#f4f6f5;--paper:#ffffff;--ink:#1b232b;--muted:#5b6874;--line:#d9dfdc;--soft:#eef3f1;--accent:#2f6f73;--accent2:#8063a6}",
+        "*{box-sizing:border-box}",
+        "body{font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,Helvetica,sans-serif;line-height:1.6;margin:0;color:var(--ink);background:var(--bg)}",
+        "body::before{content:'';display:block;height:10px;background:linear-gradient(90deg,var(--accent),#6f8f3d,var(--accent2))}",
+        "body{padding:34px 22px 56px}",
+        "body>h1,body>h2,body>h3,body>p,body>ul,body>table,body>pre,body>figure{max-width:1120px;margin-left:auto;margin-right:auto}",
+        "h1{font-size:34px;line-height:1.12;margin-top:0;margin-bottom:22px;padding-bottom:18px;border-bottom:1px solid var(--line);letter-spacing:0}",
+        "h2{font-size:23px;line-height:1.2;margin-top:38px;margin-bottom:14px;padding-top:6px;color:#173f42}",
+        "h3{font-size:17px;line-height:1.25;margin-top:24px;margin-bottom:10px;color:#27323a}",
+        "p{margin-top:8px;margin-bottom:12px;color:var(--ink)}",
+        "figure{margin-top:18px;margin-bottom:28px;padding:16px;border:1px solid var(--line);border-radius:8px;background:var(--paper);box-shadow:0 8px 24px rgba(27,35,43,.06)}",
+        "figure img{display:block;width:100%;height:auto;border-radius:4px;background:#fff}",
+        "figcaption{font-size:.92em;color:var(--muted);margin-top:10px}",
+        "table{border-collapse:separate;border-spacing:0;width:100%;margin-top:14px;margin-bottom:22px;background:var(--paper);border:1px solid var(--line);border-radius:8px;overflow:hidden;box-shadow:0 5px 16px rgba(27,35,43,.04)}",
+        "th,td{border:0;border-bottom:1px solid var(--line);padding:10px 12px;vertical-align:top;text-align:left;font-size:14px}",
+        "tr:last-child td{border-bottom:0}",
+        "th{background:var(--soft);font-weight:700;color:#22313a}",
+        "tbody tr:nth-child(even) td{background:#fafbf9}",
+        "pre{background:#fbfcfb;border:1px solid var(--line);border-radius:8px;padding:14px 16px;overflow:auto;box-shadow:inset 0 0 0 1px rgba(255,255,255,.6)}",
+        "code{font-family:Menlo,Monaco,Consolas,'Liberation Mono',monospace;font-size:.93em}",
+        "ul{margin-top:8px;margin-bottom:18px;padding-left:24px}",
+        "li{margin:5px 0}",
+        "strong{color:#102f32}",
+        "@media(max-width:760px){body{padding:22px 14px 40px}h1{font-size:27px}h2{font-size:20px}figure{padding:10px}th,td{font-size:13px;padding:8px}}",
+        "</style>",
+        "</head>",
+        "<body>",
+    ]
+
+    i = 0
+    in_list = False
+    in_code = False
+    code_lines: list[str] = []
+
+    def close_list() -> None:
+        nonlocal in_list
+        if in_list:
+            html_lines.append("</ul>")
+            in_list = False
+
+    def close_code() -> None:
+        nonlocal in_code, code_lines
+        if in_code:
+            html_lines.append("<pre><code>" + escape("\n".join(code_lines)) + "</code></pre>")
+            code_lines = []
+            in_code = False
+
+    def md_table_to_html(table_lines: list[str]) -> str:
+        if len(table_lines) < 2:
+            return ""
+        header = [c.strip() for c in table_lines[0].strip("|").split("|")]
+        rows = [
+            [c.strip() for c in row.strip("|").split("|")]
+            for row in table_lines[2:]
+            if row.strip()
+        ]
+        parts = ["<table>", "<thead><tr>"]
+        for cell in header:
+            parts.append(f"<th>{escape(cell)}</th>")
+        parts.append("</tr></thead><tbody>")
+        for row in rows:
+            parts.append("<tr>")
+            for cell in row:
+                parts.append(f"<td>{escape(cell)}</td>")
+            parts.append("</tr>")
+        parts.append("</tbody></table>")
+        return "".join(parts)
+
+    while i < len(lines):
+        line = lines[i].rstrip()
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            if in_code:
+                close_code()
+            else:
+                close_list()
+                in_code = True
+                code_lines = []
+            i += 1
+            continue
+
+        if in_code:
+            code_lines.append(line)
+            i += 1
+            continue
+
+        if not stripped:
+            close_list()
+            i += 1
+            continue
+
+        if stripped.startswith("# "):
+            close_list()
+            html_lines.append(f"<h1>{escape(stripped[2:].strip())}</h1>")
+            i += 1
+            continue
+        if stripped.startswith("## "):
+            close_list()
+            html_lines.append(f"<h2>{escape(stripped[3:].strip())}</h2>")
+            i += 1
+            continue
+        if stripped.startswith("### "):
+            close_list()
+            html_lines.append(f"<h3>{escape(stripped[4:].strip())}</h3>")
+            i += 1
+            continue
+
+        if stripped.startswith("<figure>"):
+            close_list()
+            html_lines.append(line)
+            i += 1
+            continue
+
+        if stripped.startswith("|") and stripped.endswith("|"):
+            close_list()
+            table_lines = [line]
+            j = i + 1
+            while j < len(lines) and lines[j].strip().startswith("|") and lines[j].strip().endswith("|"):
+                table_lines.append(lines[j].rstrip())
+                j += 1
+            html_lines.append(md_table_to_html(table_lines))
+            i = j
+            continue
+
+        bullet = None
+        for prefix in ("- ", "• "):
+            if stripped.startswith(prefix):
+                bullet = stripped[len(prefix):].strip()
+                break
+        if bullet is not None:
+            if not in_list:
+                close_list()
+                html_lines.append("<ul>")
+                in_list = True
+            html_lines.append(f"<li>{escape(bullet)}</li>")
+            i += 1
+            continue
+
+        close_list()
+        html_lines.append(f"<p>{escape(stripped)}</p>")
+        i += 1
+
+    close_list()
+    close_code()
+    html_lines.extend(["</body>", "</html>"])
+    return "\n".join(html_lines)
 
 
 def _format_task_reason(profile: DataProfile) -> str:
@@ -927,6 +1481,75 @@ def _format_dataset_summary(profile: DataProfile) -> str:
     if desc:
         summary += f" The source description says: {desc}."
     return summary
+
+
+def _dataset_summary_bullets(profile: DataProfile) -> list[str]:
+    source = profile.metadata.get("source", "unknown source")
+    return [
+        f"Rows: {profile.row_count}, columns: {profile.column_count}.",
+        f"Source: {source}.",
+        f"Target: {profile.metadata['target']}.",
+        f"Input descriptors: {len(profile.feature_profiles)}.",
+    ]
+
+
+def _user_input_bullets(run_context: Mapping[str, Any] | None) -> list[str]:
+    if not run_context:
+        return ["No explicit run configuration was attached to this report."]
+
+    def _fmt(value: Any) -> str:
+        if value is None:
+            return "N/A"
+        if isinstance(value, (list, tuple)):
+            return ", ".join(str(v) for v in value) if value else "none"
+        if isinstance(value, dict):
+            items = [f"{k}={v}" for k, v in value.items() if v is not None]
+            return ", ".join(items) if items else "none"
+        return str(value)
+
+    return [
+        f"API: {_fmt(run_context.get('api'))}.",
+        f"Dataset: {_fmt(run_context.get('dataset'))}.",
+        f"Source mode: {_fmt(run_context.get('source'))}.",
+        f"Run mode: {_fmt(run_context.get('mode'))}.",
+        f"Task type: {_fmt(run_context.get('task_type'))}.",
+        f"Target: {_fmt(run_context.get('target'))}.",
+        f"LLM: {_fmt(run_context.get('llm'))}.",
+        f"Model selection mode: {_fmt(run_context.get('model_mode'))}.",
+        f"Preprocessing choices: {_fmt(run_context.get('preprocessing'))}.",
+    ]
+
+
+def _feature_summary_bullets(profile: DataProfile) -> list[str]:
+    bullets: list[str] = []
+    for fp in profile.feature_profiles[:8]:
+        bullets.append(
+            f"{fp.name}: missing={fp.missing_fraction:.1%}, skew={fp.skewness}, "
+            f"outlier_iqr={fp.outlier_fraction_iqr}, target_corr={fp.target_correlation}."
+        )
+    if len(profile.feature_profiles) > 8:
+        bullets.append(f"... {len(profile.feature_profiles) - 8} more features omitted.")
+    return bullets
+
+
+def _data_distribution_bullets(profile: DataProfile) -> list[str]:
+    target = profile.target_profile
+    target_skew = target.skewness if target.skewness is not None else 0.0
+    top_corr = list(profile.correlations.get("target_correlations", {}).items())[:5]
+    corr_text = ", ".join(f"{name} ({value:+.3f})" for name, value in top_corr) if top_corr else "none"
+    skewed_features = [
+        fp.name for fp in profile.feature_profiles
+        if fp.skewness is not None and abs(fp.skewness) > 1
+    ]
+    skew_text = ", ".join(skewed_features) if skewed_features else "none"
+    return [
+        f"Target mean: {target.mean}.",
+        f"Target standard deviation: {target.std}.",
+        f"Target range: [{target.min}, {target.max}].",
+        f"Target skewness: {target_skew}.",
+        f"Strongest linear target relationships: {corr_text}.",
+        f"Skewed features: {skew_text}.",
+    ]
 
 
 def _format_risk_reason(profile: DataProfile) -> str:
@@ -1059,29 +1682,35 @@ def _interpretation_explanation(profile: DataProfile, strategy: StrategyArtifact
     )
 
 
-def _model_table_rows(models: list[str]) -> list[dict[str, str]]:
+def _model_table_rows(profile: DataProfile, models: list[str]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for model in models:
         info = MODEL_INFO.get(model, {})
         pros = info.get("pros", "Reasonable candidate for this dataset and task.")
         cons = info.get("cons", "Less specialized or more uncertain than the named candidates.")
-        rows.append({"model": model, "pros": pros, "cons": cons})
+        _, fit_reason = _score_model_fit(model, profile)
+        rows.append({"model": model, "pros": pros, "cons": cons, "fit": fit_reason})
     return rows
 
 
 def _model_selection_reason(profile: DataProfile, models: list[str]) -> str:
+    signals = _profile_fit_signals(profile)
     if profile.task_type == "classification":
         return (
-            "These models are recommended because they cover the main tradeoffs for tabular "
-            "scientific classification: an interpretable linear baseline, a regularized "
-            "ensemble, and a tree-based nonlinear model. That gives a controlled comparison "
-            "between simplicity, robustness, and flexibility."
+            f"These models are ranked for this dataset because the sample size is "
+            f"{int(signals['n_rows'])}, the feature count is {int(signals['n_features'])}, "
+            f"and the profile shows {int(signals['high_corr_pairs'])} strong feature-feature "
+            f"correlation pair(s). That means we want one linear baseline for interpretability, "
+            f"one or two tree-based models for nonlinear boundaries, and one margin-based model "
+            f"that can work after scaling."
         )
     return (
-        "These models were chosen because the dataset is small, moderately skewed, and has "
-        "visible correlation structure. A regularized linear baseline, a tree ensemble, and "
-        "a nonlinear boosting method cover the main hypothesis space without jumping "
-        "immediately to a more fragile or data-hungry model."
+        f"These models are ranked for this dataset because the sample size is "
+        f"{int(signals['n_rows'])}, the target skewness is {signals['target_skew']:.2f}, "
+        f"and the profile shows {int(signals['high_corr_pairs'])} strong feature-feature "
+        f"correlation pair(s). That combination favors regularized linear models first, then "
+        f"tree ensembles and SVR as nonlinear checks. The goal is to match each model to the "
+        f"structure the data actually show, not to force a generic shortlist."
     )
 
 
@@ -1089,20 +1718,10 @@ def _model_final_choice_reason(profile: DataProfile, models: list[str]) -> str:
     if not models:
         return "No model was selected."
     chosen = models[0]
-    if chosen in {"RandomForestRegressor", "RandomForestClassifier"}:
-        return (
-            f"{chosen} is the default first choice because it is robust, requires limited "
-            "feature engineering, and gives a reliable baseline for small scientific tables."
-        )
-    if chosen in {"Ridge", "LogisticRegression"}:
-        return (
-            f"{chosen} is the default first choice because the profile shows correlation and "
-            "limited sample size, which favors a stable linear model before trying more "
-            "complex alternatives."
-        )
+    _, fit_reason = _score_model_fit(chosen, profile)
     return (
-        f"{chosen} is the default first choice because it balances flexibility and "
-        "practicality for this dataset profile."
+        f"{chosen} is the first choice because it has the highest profile fit score among "
+        f"the shortlisted models. {fit_reason}"
     )
 
 
@@ -1122,13 +1741,13 @@ def _render_feature_table(profile: DataProfile) -> str:
     return "\n".join(lines)
 
 
-def _render_model_table(models: list[str]) -> str:
+def _render_model_table(profile: DataProfile, models: list[str]) -> str:
     lines = [
-        "| Model | Pros | Cons |",
-        "| --- | --- | --- |",
+        "| Model | Fit to this dataset | Pros | Cons |",
+        "| --- | --- | --- | --- |",
     ]
-    for row in _model_table_rows(models):
-        lines.append(f"| {row['model']} | {row['pros']} | {row['cons']} |")
+    for row in _model_table_rows(profile, models):
+        lines.append(f"| {row['model']} | {row['fit']} | {row['pros']} | {row['cons']} |")
     return "\n".join(lines)
 
 

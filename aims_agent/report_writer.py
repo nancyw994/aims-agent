@@ -9,8 +9,10 @@ Future Work, Appendix) from a completed PipelineResult.
 from __future__ import annotations
 
 import json
+import html
 import shutil
 import textwrap
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -73,6 +75,107 @@ def _read_sc_log(log_path: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _render_figure_block(image_name: str, alt_text: str, caption: str) -> str:
+    return (
+        f'<figure><img src="{image_name}" alt="{alt_text}" style="max-width:100%;height:auto;">'
+        f"<figcaption>{caption}</figcaption></figure>"
+    )
+
+
+def _make_run_output_dir(base_output_dir: str | Path) -> Path:
+    base_output_dir = Path(base_output_dir)
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+    run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    run_dir = base_output_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def _render_html_report(title: str, body_text: str) -> str:
+    escaped = html.escape(body_text)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f8fafc;
+      --panel: #ffffff;
+      --text: #0f172a;
+      --muted: #475569;
+      --border: #cbd5e1;
+      --accent: #1d4ed8;
+    }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    .wrap {{
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 32px 20px 56px;
+    }}
+    .head {{
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 16px;
+      margin-bottom: 18px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--border);
+    }}
+    h1 {{
+      margin: 0;
+      font-size: 28px;
+      line-height: 1.15;
+    }}
+    .meta {{
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }}
+    .panel {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+      padding: 20px;
+      overflow: auto;
+    }}
+    pre {{
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.55;
+    }}
+    @media (max-width: 720px) {{
+      .head {{ flex-direction: column; align-items: flex-start; }}
+      h1 {{ font-size: 23px; }}
+      .panel {{ padding: 16px; }}
+    }}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="head">
+      <h1>{html.escape(title)}</h1>
+      <div class="meta">Generated report</div>
+    </div>
+    <section class="panel">
+      <pre>{escaped}</pre>
+    </section>
+  </main>
+</body>
+</html>"""
+
+
 # ── Main writer ────────────────────────────────────────────────────────
 
 def write_pipeline_report(
@@ -89,7 +192,7 @@ def write_pipeline_report(
 
     Args:
         result: Completed PipelineResult from Agent.run_full_pipeline().
-        output_dir: Directory to save the report (created if missing).
+        output_dir: Base directory under which a new run folder is created.
         filename: Override the auto-generated filename.
 
     Returns:
@@ -98,9 +201,14 @@ def write_pipeline_report(
     now = datetime.now()
     ts_label = now.strftime("%Y-%m-%d %H:%M:%S")
     ts_file = now.strftime("%Y%m%d_%H%M%S")
-    out_dir = Path(output_dir) / "reports"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    report_path = out_dir / (filename or f"report_{ts_file}.txt")
+    run_dir = _make_run_output_dir(output_dir)
+    if filename:
+        report_name = filename
+        if Path(report_name).suffix.lower() != ".html":
+            report_name = f"{Path(report_name).stem}.html"
+    else:
+        report_name = "report.html"
+    report_path = run_dir / report_name
 
     # ── Pull data from result ──────────────────────────────────────────
     meta = result.metadata or {}
@@ -465,11 +573,40 @@ def write_pipeline_report(
         ))
 
     # Copy plot into the reports folder and interpret it
+    dist_report_path: str = ""
+    if result.distribution_plot_path:
+        src = Path(result.distribution_plot_path)
+        if src.exists():
+            dest = run_dir / src.name
+            shutil.copy2(src, dest)
+            dist_report_path = str(dest)
+        else:
+            dist_report_path = result.distribution_plot_path
+
+        paras.append(_h3("2.2b  Data Distribution Plot"))
+        paras.append(_p(
+            f"The data distribution plot has been saved alongside this report at: "
+            f"{dist_report_path}."
+        ))
+        paras.append(
+            _render_figure_block(
+                Path(dist_report_path).name,
+                "Data distribution plot",
+                "Target and feature distribution overview used to judge skew, spread, and balance before modeling.",
+            )
+        )
+        paras.append(_p(
+            f"This figure summarizes the target and feature distributions before model "
+            f"training. In this run the target is skewed and several features are not "
+            f"symmetrically distributed, so the plot explains why robust preprocessing "
+            f"and regularized or tree-based models are reasonable choices."
+        ))
+
     plot_report_path: str = ""
     if result.plot_path:
         src = Path(result.plot_path)
         if src.exists():
-            dest = out_dir / src.name
+            dest = run_dir / src.name
             shutil.copy2(src, dest)
             plot_report_path = str(dest)
         else:
@@ -480,6 +617,13 @@ def write_pipeline_report(
             f"The performance plot has been saved alongside this report at: "
             f"{plot_report_path}."
         ))
+        paras.append(
+            _render_figure_block(
+                Path(plot_report_path).name,
+                "Model performance plot",
+                "Predicted-vs-actual and residual diagnostics for the trained model.",
+            )
+        )
 
         if task_type == "regression":
             paras.append(_p(
@@ -827,7 +971,8 @@ def write_pipeline_report(
     paras.append("=" * _WIDTH)
 
     report_text = "\n\n".join(paras) + "\n"
-    report_path.write_text(report_text, encoding="utf-8")
+    report_html = _render_html_report("AIMS Agent Pipeline Report", report_text)
+    report_path.write_text(report_html, encoding="utf-8")
     return str(report_path.resolve())
 
 

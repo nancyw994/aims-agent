@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, List, Literal, Mapping
 
+import numpy as np
+
 from aims_agent.code_writer import (
     codegen_required_packages,
     dl_backend_candidates,
@@ -21,6 +23,7 @@ from aims_agent.llm import LMF_LLM
 from aims_agent.model_selector import ModelSuggestion, get_default_suggestion, get_model_suggestion, load_model_class, suggest_model, suggest_models
 from aims_agent.model_trainer import ModelTrainer
 from aims_agent.results_analyzer import compute_metrics, interpret_from_metrics, interpret_with_llm, plot_results
+from aims_agent.uncertainty_evaluator import UncertaintyEvaluator
 from aims_agent.validator import (
     validate_dl_training_trace,
     validate_training_result_detailed,
@@ -208,6 +211,9 @@ class Agent:
             # Step 3: Execute plan
             suggestion = None
             y_true, y_pred = None, None
+            y_std = None
+            if task_type == "regression" and not skip_training:
+                UncertaintyEvaluator.check_availability()
 
             for plan_item in plan_actions:
                 action = (plan_item.get("action") or "").strip().lower().replace(" ", "_")
@@ -436,12 +442,42 @@ class Agent:
                     trainer.prepare_data(bundle.df, metadata["features"], metadata["target"])
                     trainer.train()
                     y_true, y_pred = trainer.predict()
+                    if task_type == "regression":
+                        uq_pred = trainer.predict_with_uncertainty()
+                        y_std = uq_pred.get("y_std")
+                        if y_std is None or not any(float(v) > 0 for v in y_std):
+                            residual_std = float(np.std(np.asarray(y_true) - np.asarray(y_pred), ddof=1))
+                            y_std = np.full(len(y_pred), max(residual_std, 1e-8))
                     continue
 
                 # evaluate
                 if action == "evaluate":
                     if y_true is not None and y_pred is not None and suggestion is not None:
                         result.metrics = compute_metrics(y_true, y_pred, task_type=task_type)
+                        if task_type == "regression":
+                            if y_std is None:
+                                residual_std = float(np.std(np.asarray(y_true) - np.asarray(y_pred), ddof=1))
+                                y_std = np.full(len(y_pred), max(residual_std, 1e-8))
+                            uq_summary, _ = UncertaintyEvaluator.evaluate_all(
+                                y_true,
+                                y_pred,
+                                y_std,
+                                verbose=False,
+                            )
+                            uq_coverage = UncertaintyEvaluator.compute_coverage(y_true, y_pred, y_std)
+                            result.metrics.update(
+                                {
+                                    "UQ_Calibration_MAE": uq_summary.get("calibration_mae"),
+                                    "UQ_Calibration_RMSE": uq_summary.get("calibration_rmse"),
+                                    "UQ_Miscalibration_Area": uq_summary.get("miscalibration_area"),
+                                    "UQ_Sharpness": uq_summary.get("sharpness"),
+                                    "UQ_NLL": uq_summary.get("nll"),
+                                    "UQ_CRPS": uq_summary.get("crps"),
+                                    "UQ_Coverage_68": uq_coverage.get(0.68),
+                                    "UQ_Coverage_95": uq_coverage.get(0.95),
+                                    "UQ_Coverage_99": uq_coverage.get(0.99),
+                                }
+                            )
                         result.plot_path = plot_results(
                             y_true, y_pred, task_type=task_type
                         )

@@ -169,7 +169,7 @@ class ModelTrainer:
                     n_iter=min(self.n_iter, self._count_combinations(param_grid)),
                     cv=cv_folds,
                     scoring=scoring,
-                    n_jobs=-1,
+                    n_jobs=1,
                     random_state=42,
                 )
             else:
@@ -178,7 +178,7 @@ class ModelTrainer:
                     param_grid,
                     cv=cv_folds,
                     scoring=scoring,
-                    n_jobs=-1,
+                    n_jobs=1,
                 )
             search.fit(self.X_train, self.y_train)
             self.model = search.best_estimator_
@@ -197,6 +197,99 @@ class ModelTrainer:
         """Return (y_true, y_pred) on the test set."""
         y_pred = self.model.predict(self.X_test)
         return self.y_test.values, y_pred
+
+    def predict_with_uncertainty(self) -> dict[str, np.ndarray]:
+        """
+        Return predictions with uncertainty quantification.
+
+        Supports:
+        - ProbabilisticNN: Native distribution prediction
+        - Ensemble models (RandomForest, GradientBoosting): Variance across estimators
+        - Classification: Prediction entropy
+        - GaussianProcess: Native uncertainty
+
+        Returns:
+            Dictionary with:
+                - 'y_true': True values
+                - 'y_pred': Point predictions (mean)
+                - 'y_std': Standard deviations (uncertainties)
+                - Additional model-specific fields
+        """
+        model_name = self.model_class.__name__
+
+        result = {
+            'y_true': self.y_test.values,
+        }
+
+        # ProbabilisticNN: native distribution prediction
+        if 'ProbabilisticNN' in model_name or hasattr(self.model, 'predict_distribution'):
+            try:
+                dist = self.model.predict_distribution(self.X_test.values)
+                result.update({
+                    'y_pred': dist['mu'],
+                    'y_std': dist['std'],
+                    'lower_95': dist.get('lower_95'),
+                    'upper_95': dist.get('upper_95'),
+                })
+                return result
+            except Exception as e:
+                print(f"[ModelTrainer] ProbabilisticNN distribution prediction failed: {e}")
+                # Fall through to default prediction
+
+        # GaussianProcess: native uncertainty via return_std=True
+        if 'GaussianProcess' in model_name:
+            try:
+                mu, std = self.model.predict(self.X_test, return_std=True)
+                result.update({
+                    'y_pred': mu,
+                    'y_std': std,
+                })
+                return result
+            except Exception:
+                # Fall through if return_std not supported
+                pass
+
+        # Ensemble methods: use variance across estimators
+        if hasattr(self.model, 'estimators_'):
+            # RandomForest, GradientBoosting, etc.
+            predictions = np.array([
+                estimator.predict(self.X_test)
+                for estimator in self.model.estimators_
+            ])
+            # predictions.shape = (n_estimators, n_samples)
+
+            y_pred = np.mean(predictions, axis=0)
+            y_std = np.std(predictions, axis=0)
+
+            result.update({
+                'y_pred': y_pred,
+                'y_std': y_std,
+            })
+
+            return result
+
+        # Classification: use prediction entropy
+        if self.task_type == "classification" and hasattr(self.model, 'predict_proba'):
+            y_proba = self.model.predict_proba(self.X_test)
+            y_pred = self.model.predict(self.X_test)
+
+            # Compute entropy as uncertainty
+            proba_clipped = np.clip(y_proba, 1e-10, 1.0)
+            entropy = -np.sum(proba_clipped * np.log(proba_clipped), axis=1)
+
+            result.update({
+                'y_pred': y_pred,
+                'y_std': entropy,  # Use entropy as uncertainty measure
+                'y_proba': y_proba,
+            })
+
+            return result
+
+        y_pred = self.model.predict(self.X_test)
+        result['y_pred'] = y_pred
+        result['y_std'] = np.zeros_like(y_pred)
+
+        return result
 
 
 __all__ = ["ModelTrainer", "DEFAULT_REGRESSION_GRIDS", "DEFAULT_CLASSIFICATION_GRIDS"]

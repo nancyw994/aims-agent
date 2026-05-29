@@ -423,6 +423,8 @@ class MaterialsProjectDataIngestor(DataInterface):
             df = fetch_materials_project_summary(config)
             source = config.get("source", "Materials Project summary API")
 
+        raw_shape = df.shape
+        raw_dtypes = {c: str(dt) for c, dt in df.dtypes.items()}
         processed, features, target, report = clean_and_preprocess_materials_data(
             df,
             target=config.get("target"),
@@ -449,8 +451,8 @@ class MaterialsProjectDataIngestor(DataInterface):
                 "description",
                 f"Real materials data ingested from {source}. Preprocessing: {report.summary()}",
             ),
-            shape=processed.shape,
-            dtypes={c: str(dt) for c, dt in processed.dtypes.items()},
+            shape=raw_shape,
+            dtypes=raw_dtypes,
         )
         validate_schema(processed, schema)
         return DatasetBundle(df=processed, schema=schema)

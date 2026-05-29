@@ -1,7 +1,2 @@
-# Optional deep-learning dependencies for Week 6 features.
-# Install only when you need DL codegen/components:
-#   pip install -r requirements-dl.txt
-
 torch>=2.2.0
-# Optional TensorFlow backend (enabled by request keywords: tensorflow / keras)
 tensorflow-cpu>=2.16.0

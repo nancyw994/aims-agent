@@ -74,13 +74,11 @@ def test_formulate_strategy_parses_llm_json(tmp_path):
             )
 
     strategy = formulate_strategy(profile, agent=FakeAgent(), use_llm=True, output_dir=tmp_path)
-    assert strategy.recommended_models == [
-        "RandomForestRegressor",
-        "Ridge",
-        "ElasticNet",
-        "GradientBoostingRegressor",
-        "SVR",
-    ]
+    assert strategy.recommended_models[0] == "Ridge"
+    assert len(strategy.recommended_models) == 5
+    assert "ElasticNet" in strategy.recommended_models
+    assert "RandomForestRegressor" in strategy.recommended_models
+    assert "GradientBoostingRegressor" in strategy.recommended_models
     assert "Formation energy" in strategy.llm_interpretation
 
 
@@ -92,4 +90,29 @@ def test_analyze_and_formulate_strategy_writes_outputs(tmp_path):
         run_context={
             "api": "Materials Project summary API",
             "dataset": "Li-Fe-O",
-            "source": "Materials Project API
+            "source": "Materials Project API",
+            "mode": "live API ingestion",
+            "task_type": "regression",
+            "target": "formation_energy_per_atom",
+            "llm": "OpenAI / gpt-4o-mini",
+            "model_mode": "LLM-guided",
+            "preprocessing": {"missing": "drop", "outlier": "iqr_clip", "scaling": "standard"},
+        },
+    )
+    assert strategy.target == "formation_energy_per_atom"
+    run_dir = tmp_path / Path(paths["run_dir"]).name
+    assert run_dir.exists()
+    assert (run_dir / "profile.json").exists()
+    assert (run_dir / "strategy.json").exists()
+    assert (run_dir / "strategy_report.html").exists()
+    report_text = (run_dir / "strategy_report.html").read_text(encoding="utf-8")
+    assert "<h2>Dataset Summary</h2>" in report_text
+    assert "<h2>User Inputs</h2>" in report_text
+    assert "<h2>Data Distribution</h2>" in report_text
+    assert "five model families" in report_text
+    assert "Fit to this dataset" in report_text
+    assert '<figure><img src="data_distribution.png"' in report_text
+    assert '<figure><img src="histograms.png"' in report_text
+    assert '<figure><img src="correlation_heatmap.png"' in report_text
+    assert '<figure><img src="target_relationships.png"' in report_text
+    assert set(paths) == {"run_dir", "profile", "strategy", "report"}

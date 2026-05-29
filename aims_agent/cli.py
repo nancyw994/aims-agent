@@ -12,6 +12,21 @@ from aims_agent.model_selector import suggest_models, ModelSuggestion, list_all_
 from aims_agent.task_type_suggest import _heuristic_task_type, suggest_task_type
 
 
+def _run_integrated_dataset_analysis_from_args(args) -> None:
+    from aims_agent.model_strategy_analysis import run_model_strategy_analysis
+
+    print("\nRunning integrated dataset analysis.")
+    output_dir = run_model_strategy_analysis(
+        data_path=args.data,
+        target=args.target,
+        output_root=args.report_dir,
+        background_knowledge=args.background_knowledge,
+        motivation=args.motivation,
+        use_llm=not args.no_llm,
+    )
+    print(f"\nStrategy report: {output_dir / 'strategy_report.html'}")
+
+
 def _resolve_task_type(
     agent: Agent,
     loader,
@@ -391,7 +406,7 @@ Examples:
         "--report-dir",
         default="results",
         metavar="DIR",
-        help="Directory to save the plain-language pipeline report (default: results).",
+        help="Base directory under which a new run_* folder and HTML report will be saved (default: results).",
     )
 
     return p.parse_args()
@@ -421,6 +436,10 @@ def main():
     if not args.motivation:
         import argparse
         argparse.ArgumentParser().error("--motivation is required unless --list-models is used")
+
+    if args.data:
+        _run_integrated_dataset_analysis_from_args(args)
+        return
 
     agent = Agent()
 

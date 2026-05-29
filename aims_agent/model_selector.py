@@ -28,12 +28,20 @@ class ModelSuggestion:
     package_name: str
     import_path: str
     reason: str
+    
+    # Uncertainty quantification metadata
+    uq_capability: str = "none"  # "native", "ensemble", "calibration", "none"
+    uq_quality: float = 0.0      # 0.0-1.0, expected UQ calibration quality
+    heteroscedastic: bool = False  # Supports input-dependent uncertainty
 
 DEFAULT_SUGGESTION = ModelSuggestion(
     model_name="RandomForestRegressor",
     package_name="scikit-learn",
     import_path="sklearn.ensemble.RandomForestRegressor",
     reason="Default fallback: random forest works well for most regression tasks",
+    uq_capability="ensemble",
+    uq_quality=0.7,
+    heteroscedastic=False,
 )
 
 DEFAULT_CLASSIFICATION_SUGGESTION = ModelSuggestion(
@@ -41,6 +49,9 @@ DEFAULT_CLASSIFICATION_SUGGESTION = ModelSuggestion(
     package_name="scikit-learn",
     import_path="sklearn.ensemble.RandomForestClassifier",
     reason="Default fallback: random forest works well for multi-class classification",
+    uq_capability="ensemble",
+    uq_quality=0.7,
+    heteroscedastic=False,
 )
 
 
@@ -50,8 +61,136 @@ def get_default_suggestion(task_type: str) -> "ModelSuggestion":
         return DEFAULT_CLASSIFICATION_SUGGESTION
     return DEFAULT_SUGGESTION
 
+
+def enrich_suggestion_with_uq_metadata(suggestion: ModelSuggestion) -> ModelSuggestion:
+    """
+    Enrich a model suggestion with UQ capability metadata from MODEL_UQ_CAPABILITY.
+    
+    If the model is not in the capability map, returns the suggestion unchanged.
+    """
+    if suggestion.model_name in MODEL_UQ_CAPABILITY:
+        meta = MODEL_UQ_CAPABILITY[suggestion.model_name]
+        suggestion.uq_capability = meta["uq_capability"]
+        suggestion.uq_quality = meta["uq_quality"]
+        suggestion.heteroscedastic = meta["heteroscedastic"]
+    
+    return suggestion
+
+
+def select_uq_aware_model(
+    n_samples: int,
+    n_features: int,
+    task_type: str = "regression",
+    use_case: str = "exploration",
+    target_multimodal: bool = False,
+    needs_interpretability: bool = False,
+) -> ModelSuggestion:
+    """
+    Intelligent UQ-aware model selection based on data characteristics and use case.
+    
+    Args:
+        n_samples: Number of training samples
+        n_features: Number of features
+        task_type: "regression" or "classification"
+        use_case: "exploration", "screening", "active_learning", "production"
+        target_multimodal: Whether target distribution is multimodal
+        needs_interpretability: Whether model interpretability is required
+    
+    Returns:
+        ModelSuggestion with UQ metadata
+    """
+    
+    # High-UQ use cases (screening, active learning)
+    if use_case in ["screening", "active_learning"]:
+        
+        # Small datasets → Gaussian Process (gold standard)
+        if n_samples < 1000:
+            model_name = "GaussianProcessRegressor" if task_type == "regression" else "GaussianProcessClassifier"
+            
+        # Medium datasets → Probabilistic NN
+        elif 1000 <= n_samples <= 50000:
+            if task_type == "regression":
+                model_name = "ProbabilisticNN"
+            else:
+                # For classification, fall back to ensemble
+                model_name = "RandomForestClassifier"
+        
+        # Large datasets → Ensemble (scalable)
+        else:
+            model_name = "RandomForestRegressor" if task_type == "regression" else "RandomForestClassifier"
+    
+    # Exploration / baseline (balance accuracy + speed)
+    elif use_case == "exploration":
+        
+        if needs_interpretability:
+            # Interpretable models
+            model_name = "RandomForestRegressor" if task_type == "regression" else "RandomForestClassifier"
+        
+        elif n_samples < 10000:
+            # Medium data → GradientBoosting
+            model_name = "GradientBoostingRegressor" if task_type == "regression" else "GradientBoostingClassifier"
+        
+        else:
+            # Large data → XGBoost (fastest)
+            model_name = "XGBRegressor" if task_type == "regression" else "XGBClassifier"
+    
+    # Production (need reliability + speed)
+    elif use_case == "production":
+        
+        if n_samples < 5000:
+            model_name = "RandomForestRegressor" if task_type == "regression" else "RandomForestClassifier"
+        else:
+            model_name = "XGBRegressor" if task_type == "regression" else "XGBClassifier"
+    
+    # Default fallback
+    else:
+        model_name = "RandomForestRegressor" if task_type == "regression" else "RandomForestClassifier"
+    
+    # Build suggestion
+    if model_name == "ProbabilisticNN":
+        # Custom model
+        suggestion = ModelSuggestion(
+            model_name="ProbabilisticNN",
+            package_name="aims-agent",
+            import_path="aims_agent.probabilistic_models.pnn.ProbabilisticNNWrapper",
+            reason=f"Probabilistic NN for {n_samples} samples: native distribution prediction with heteroscedastic uncertainty",
+            uq_capability="native",
+            uq_quality=0.9,
+            heteroscedastic=True,
+        )
+    elif model_name in MODEL_IMPORT_MAP:
+        module_path, class_name = MODEL_IMPORT_MAP[model_name]
+        package = "scikit-learn"
+        if "xgboost" in module_path:
+            package = "xgboost"
+        elif "lightgbm" in module_path:
+            package = "lightgbm"
+        elif "catboost" in module_path:
+            package = "catboost"
+        
+        meta = MODEL_UQ_CAPABILITY.get(model_name, {})
+        
+        suggestion = ModelSuggestion(
+            model_name=model_name,
+            package_name=package,
+            import_path=f"{module_path}.{class_name}",
+            reason=meta.get("best_for", f"Selected for {use_case} use case with {n_samples} samples"),
+            uq_capability=meta.get("uq_capability", "none"),
+            uq_quality=meta.get("uq_quality", 0.0),
+            heteroscedastic=meta.get("heteroscedastic", False),
+        )
+    else:
+        # Unknown model, use default
+        suggestion = get_default_suggestion(task_type)
+    
+    return suggestion
+
 # Maps model class name -> (module path, class name) for reliable import path and dynamic load
 MODEL_IMPORT_MAP: dict[str, tuple[str, str]] = {
+    # ── Probabilistic Models (Native Uncertainty) ─────────────────────
+    "ProbabilisticNN": ("aims_agent.probabilistic_models.pnn", "ProbabilisticNNWrapper"),
+    "ProbabilisticNNWrapper": ("aims_agent.probabilistic_models.pnn", "ProbabilisticNNWrapper"),
+    
     # ── Regression ────────────────────────────────────────────────────
     "RandomForestRegressor": ("sklearn.ensemble", "RandomForestRegressor"),
     "GradientBoostingRegressor": ("sklearn.ensemble", "GradientBoostingRegressor"),
@@ -70,6 +209,12 @@ MODEL_IMPORT_MAP: dict[str, tuple[str, str]] = {
     "XGBRegressor": ("xgboost", "XGBRegressor"),
     "LGBMRegressor": ("lightgbm", "LGBMRegressor"),
     "CatBoostRegressor": ("catboost", "CatBoostRegressor"),
+    
+    # ── Gaussian Process (Native Uncertainty) ─────────────────────────
+    "GaussianProcessRegressor": ("sklearn.gaussian_process", "GaussianProcessRegressor"),
+    "GaussianProcessClassifier": ("sklearn.gaussian_process", "GaussianProcessClassifier"),
+    
+    # ── Classification ────────────────────────────────────────────────
     "RandomForestClassifier": ("sklearn.ensemble", "RandomForestClassifier"),
     "GradientBoostingClassifier": ("sklearn.ensemble", "GradientBoostingClassifier"),
     "DecisionTreeClassifier": ("sklearn.tree", "DecisionTreeClassifier"),
@@ -90,12 +235,181 @@ MODEL_IMPORT_MAP: dict[str, tuple[str, str]] = {
 
 REGRESSION_MODELS = sorted([
     m for m in MODEL_IMPORT_MAP
-    if m.endswith("Regressor") or m in ("Ridge", "Lasso", "ElasticNet", "LinearRegression", "SVR")
+    if m.endswith("Regressor") or m in ("Ridge", "Lasso", "ElasticNet", "LinearRegression", "SVR", "ProbabilisticNN")
 ])
 CLASSIFICATION_MODELS = sorted([
     m for m in MODEL_IMPORT_MAP
     if m.endswith("Classifier") or m in ("GaussianNB", "BernoulliNB", "SVC", "LogisticRegression")
 ])
+
+
+# ============================================================================
+# Uncertainty Quantification Capability Metadata
+# ============================================================================
+
+MODEL_UQ_CAPABILITY = {
+    # ── Native Distribution Predictors (Highest Quality) ──────────────────
+    "GaussianProcessRegressor": {
+        "uq_capability": "native",
+        "uq_quality": 1.0,
+        "heteroscedastic": True,
+        "best_for": "<5K samples, gold-standard calibrated UQ, interpretable kernel",
+        "recommended_use_cases": ["screening", "active_learning", "small_data"],
+    },
+    "GaussianProcessClassifier": {
+        "uq_capability": "native",
+        "uq_quality": 0.95,
+        "heteroscedastic": True,
+        "best_for": "<2K samples, probabilistic classification",
+        "recommended_use_cases": ["screening", "active_learning", "small_data"],
+    },
+    "ProbabilisticNN": {
+        "uq_capability": "native",
+        "uq_quality": 0.9,
+        "heteroscedastic": True,
+        "best_for": "500-50K samples, scalable native distribution prediction",
+        "recommended_use_cases": ["screening", "active_learning", "production"],
+    },
+    
+    # ── Ensemble Methods (High Quality via Variance) ──────────────────────
+    "RandomForestRegressor": {
+        "uq_capability": "ensemble",
+        "uq_quality": 0.7,
+        "heteroscedastic": False,
+        "best_for": "General purpose, robust, interpretable feature importance",
+        "recommended_use_cases": ["exploration", "baseline", "feature_analysis"],
+    },
+    "RandomForestClassifier": {
+        "uq_capability": "ensemble",
+        "uq_quality": 0.7,
+        "heteroscedastic": False,
+        "best_for": "General purpose classification with uncertainty",
+        "recommended_use_cases": ["exploration", "baseline"],
+    },
+    "GradientBoostingRegressor": {
+        "uq_capability": "ensemble",
+        "uq_quality": 0.75,
+        "heteroscedastic": False,
+        "best_for": "High accuracy + reasonable uncertainty via estimators",
+        "recommended_use_cases": ["exploration", "baseline"],
+    },
+    "GradientBoostingClassifier": {
+        "uq_capability": "ensemble",
+        "uq_quality": 0.75,
+        "heteroscedastic": False,
+        "best_for": "High accuracy classification with uncertainty",
+        "recommended_use_cases": ["exploration", "baseline"],
+    },
+    "ExtraTreesRegressor": {
+        "uq_capability": "ensemble",
+        "uq_quality": 0.7,
+        "heteroscedastic": False,
+        "best_for": "Fast ensemble with uncertainty",
+        "recommended_use_cases": ["exploration"],
+    },
+    "ExtraTreesClassifier": {
+        "uq_capability": "ensemble",
+        "uq_quality": 0.7,
+        "heteroscedastic": False,
+        "best_for": "Fast ensemble classification",
+        "recommended_use_cases": ["exploration"],
+    },
+    
+    # ── Can Add Calibration (Medium Quality) ──────────────────────────────
+    "XGBRegressor": {
+        "uq_capability": "calibration",
+        "uq_quality": 0.5,
+        "heteroscedastic": False,
+        "best_for": "Highest accuracy, add uncertainty via conformal prediction",
+        "recommended_use_cases": ["exploration", "accuracy_first"],
+    },
+    "XGBClassifier": {
+        "uq_capability": "calibration",
+        "uq_quality": 0.5,
+        "heteroscedastic": False,
+        "best_for": "High accuracy, requires probability calibration",
+        "recommended_use_cases": ["exploration", "accuracy_first"],
+    },
+    "LGBMRegressor": {
+        "uq_capability": "calibration",
+        "uq_quality": 0.5,
+        "heteroscedastic": False,
+        "best_for": "Fast training, add uncertainty via calibration",
+        "recommended_use_cases": ["exploration", "large_data"],
+    },
+    "LGBMClassifier": {
+        "uq_capability": "calibration",
+        "uq_quality": 0.5,
+        "heteroscedastic": False,
+        "best_for": "Fast classification, requires calibration",
+        "recommended_use_cases": ["exploration", "large_data"],
+    },
+    "CatBoostRegressor": {
+        "uq_capability": "calibration",
+        "uq_quality": 0.55,
+        "heteroscedastic": False,
+        "best_for": "Handles categorical features well, add uncertainty",
+        "recommended_use_cases": ["exploration", "categorical_features"],
+    },
+    "MLPRegressor": {
+        "uq_capability": "calibration",
+        "uq_quality": 0.4,
+        "heteroscedastic": False,
+        "best_for": "Neural network baseline, consider ProbabilisticNN instead",
+        "recommended_use_cases": ["exploration"],
+    },
+    
+    # ── No Native UQ (Low/No Quality) ─────────────────────────────────────
+    "LinearRegression": {
+        "uq_capability": "none",
+        "uq_quality": 0.2,
+        "heteroscedastic": False,
+        "best_for": "Interpretability, assumes homoscedastic Gaussian noise",
+        "recommended_use_cases": ["exploration", "interpretability"],
+    },
+    "Ridge": {
+        "uq_capability": "none",
+        "uq_quality": 0.25,
+        "heteroscedastic": False,
+        "best_for": "Regularized linear model, limited UQ",
+        "recommended_use_cases": ["exploration", "interpretability"],
+    },
+    "Lasso": {
+        "uq_capability": "none",
+        "uq_quality": 0.25,
+        "heteroscedastic": False,
+        "best_for": "Feature selection, limited UQ",
+        "recommended_use_cases": ["exploration", "feature_selection"],
+    },
+    "SVR": {
+        "uq_capability": "none",
+        "uq_quality": 0.3,
+        "heteroscedastic": False,
+        "best_for": "Non-linear regression, requires separate calibration",
+        "recommended_use_cases": ["exploration"],
+    },
+    "SVC": {
+        "uq_capability": "none",
+        "uq_quality": 0.3,
+        "heteroscedastic": False,
+        "best_for": "Non-linear classification, requires Platt scaling",
+        "recommended_use_cases": ["exploration"],
+    },
+    "LogisticRegression": {
+        "uq_capability": "calibration",
+        "uq_quality": 0.6,
+        "heteroscedastic": False,
+        "best_for": "Simple probabilistic classifier, reasonably calibrated",
+        "recommended_use_cases": ["exploration", "baseline"],
+    },
+    "KNeighborsRegressor": {
+        "uq_capability": "none",
+        "uq_quality": 0.4,
+        "heteroscedastic": True,
+        "best_for": "Local uncertainty via neighbor variance, not well-calibrated",
+        "recommended_use_cases": ["exploration"],
+    },
+}
 
 
 def list_all_models(task_type: str = "all") -> List[str]:
@@ -125,20 +439,32 @@ def get_model_suggestion(model_name: str, task_type: str) -> ModelSuggestion | N
         return None
     if task_type == "classification" and model_name not in CLASSIFICATION_MODELS:
         return None
+    
     module_path, class_name = MODEL_IMPORT_MAP[model_name]
-    pkg = "scikit-learn"
-    if model_name.startswith("XGB"):
+    
+    # Determine package name
+    if "aims_agent" in module_path:
+        pkg = "aims-agent"
+    elif model_name.startswith("XGB"):
         pkg = "xgboost"
     elif model_name.startswith("LGBM"):
         pkg = "lightgbm"
     elif model_name.startswith("CatBoost"):
         pkg = "catboost"
-    return ModelSuggestion(
+    elif "gaussian_process" in module_path:
+        pkg = "scikit-learn"
+    else:
+        pkg = "scikit-learn"
+    
+    suggestion = ModelSuggestion(
         model_name=model_name,
         package_name=pkg,
         import_path=f"{module_path}.{class_name}",
         reason=f"User-specified model: {model_name}",
     )
+    
+    # Enrich with UQ metadata
+    return enrich_suggestion_with_uq_metadata(suggestion)
 
 
 def suggest_models(
@@ -156,7 +482,22 @@ def suggest_models(
     Returns a list of ModelSuggestion (or [DEFAULT_SUGGESTION] if parsing fails).
     """
     features_str = ", ".join(features)
-    prompt = f"""You are an ML and Statistical Modeling expert in materials science. Based on the dataset and its distribution below, recommend {n_suggestions} different ML models that are well-suited. You may choose from scikit-learn, xgboost, lightgbm, catboost, or any other standard Python ML library in Python. Do NOT be limited to a fixed list—pick the best models for this data and task.
+    prompt = f"""You are an ML and Statistical Modeling expert in materials science with expertise in uncertainty quantification. Based on the dataset and its distribution below, recommend {n_suggestions} different ML models that are well-suited. You may choose from scikit-learn, xgboost, lightgbm, catboost, or any other standard Python ML library in Python. Do NOT be limited to a fixed list—pick the best models for this data and task.
+
+CRITICAL: Prioritize models with native uncertainty quantification capability:
+
+**Tier 1 - Native Distribution Predictors (BEST for uncertainty-critical tasks):**
+- ProbabilisticNN (for 500-50K samples): Predicts full Gaussian distributions N(mu(x), sigma²(x)) with heteroscedastic uncertainty
+  - Import: aims_agent.probabilistic_models.pnn.ProbabilisticNNWrapper
+  - Package: aims-agent (custom)
+- GaussianProcessRegressor (for <5K samples): Gold-standard calibrated uncertainty
+  - Import: sklearn.gaussian_process.GaussianProcessRegressor
+
+**Tier 2 - Ensemble Methods (Good uncertainty via variance):**
+- RandomForest, GradientBoosting, ExtraTrees: Provide uncertainty through estimator variance
+
+**Tier 3 - Standard Models (Require calibration):**
+- XGBoost, LightGBM: High accuracy but need post-hoc uncertainty calibration
 
 Input features: {features_str}
 Target variable: {target}
@@ -171,15 +512,23 @@ Each object MUST have all four fields:
   - model_name: the class name (e.g. RandomForestClassifier)
   - package: the pip install name (e.g. scikit-learn for sklearn, xgboost, lightgbm, catboost)
   - import_path: CRITICAL — full Python import path (e.g. sklearn.ensemble.RandomForestClassifier). Without import_path we cannot load the model. Always provide it.
-  - reason: 1-2 sentences with professional reasoning based on task type and data characteristics
+  - reason: 1-2 sentences with professional reasoning based on task type, data characteristics, and uncertainty quantification capability
 
 Task-type constraint:
 - If Task type is regression, only suggest regression models.
 - If Task type is classification, only suggest classification models.
+- Prioritize models that support uncertainty estimation (ensembles, probabilistic models).
 
-Example:
+Example for regression:
 [
-  {"model_name": "RandomForestClassifier", "package": "scikit-learn", "import_path": "sklearn.ensemble.RandomForestClassifier", "reason": "Robust to skewed features."},
+  {"model_name": "ProbabilisticNN", "package": "aims-agent", "import_path": "aims_agent.probabilistic_models.pnn.ProbabilisticNNWrapper", "reason": "Native Gaussian distribution prediction with heteroscedastic uncertainty for materials property prediction."},
+  {"model_name": "RandomForestRegressor", "package": "scikit-learn", "import_path": "sklearn.ensemble.RandomForestRegressor", "reason": "Robust ensemble with uncertainty via estimator variance."},
+  {"model_name": "GradientBoostingRegressor", "package": "scikit-learn", "import_path": "sklearn.ensemble.GradientBoostingRegressor", "reason": "High accuracy with reasonable uncertainty estimates."}
+]
+
+Example for classification:
+[
+  {"model_name": "RandomForestClassifier", "package": "scikit-learn", "import_path": "sklearn.ensemble.RandomForestClassifier", "reason": "Robust to skewed features with probability estimates."},
   {"model_name": "XGBClassifier", "package": "xgboost", "import_path": "xgboost.XGBClassifier", "reason": "Handles class imbalance via scale_pos_weight."}
 ]
 """
@@ -191,6 +540,9 @@ Example:
     if not suggestions:
         print("[ModelSelector] Could not parse LLM response, using default model.")
         return [get_default_suggestion(task_hint)]
+
+    # Enrich suggestions with UQ metadata
+    suggestions = [enrich_suggestion_with_uq_metadata(s) for s in suggestions]
 
     return suggestions
 

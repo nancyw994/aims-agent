@@ -16,6 +16,7 @@ logs/
 # Runtime outputs
 results/
 catboost_info/
+generated_code/
 
 # Python
 __pycache__/

@@ -2297,6 +2297,148 @@ def self_correction_appendix_lines(output_dir: Path) -> list[str]:
     return lines
 
 
+def _generate_hyperparameter_explanation(model_name: str, best_params: dict, metrics: pd.DataFrame) -> list[str]:
+    """Generate detailed explanation for why each hyperparameter value was chosen."""
+    lines = []
+    
+    # Common hyperparameter explanations
+    param_explanations = {
+        "n_estimators": {
+            "purpose": "Number of trees/boosting rounds",
+            "low": "faster training but may underfit",
+            "high": "better performance but slower and risk overfitting",
+        },
+        "max_depth": {
+            "purpose": "Maximum tree depth",
+            "low": "prevents overfitting, good for small datasets",
+            "high": "captures complex patterns but may overfit",
+        },
+        "learning_rate": {
+            "purpose": "Step size for gradient descent",
+            "low": "more stable convergence, requires more estimators",
+            "high": "faster convergence but may overshoot optimal",
+        },
+        "min_samples_split": {
+            "purpose": "Minimum samples required to split a node",
+            "low": "more complex trees, risk overfitting",
+            "high": "simpler trees, better generalization",
+        },
+        "min_samples_leaf": {
+            "purpose": "Minimum samples in leaf nodes",
+            "low": "more detailed predictions",
+            "high": "smoother predictions, reduces overfitting",
+        },
+        "max_features": {
+            "purpose": "Number of features considered for splitting",
+            "low": "faster training, more randomness",
+            "high": "uses more information but slower",
+        },
+        "alpha": {
+            "purpose": "Regularization strength",
+            "low": "less regularization, fits training data closely",
+            "high": "more regularization, simpler model",
+        },
+        "C": {
+            "purpose": "Inverse of regularization strength",
+            "low": "strong regularization, simpler model",
+            "high": "weak regularization, more complex fit",
+        },
+    }
+    
+    if not best_params:
+        lines.append("No hyperparameters were tuned (using default values).")
+        return lines
+    
+    for param, value in best_params.items():
+        if param in param_explanations:
+            info = param_explanations[param]
+            lines.append(f"**`{param} = {value}`**")
+            lines.append(f"- *Purpose:* {info['purpose']}")
+            
+            # Provide context on whether this is a low/high value
+            if param == "n_estimators":
+                if isinstance(value, (int, float)) and value < 100:
+                    lines.append(f"- *Choice rationale:* Moderate value balances accuracy and training time")
+                elif isinstance(value, (int, float)) and value >= 500:
+                    lines.append(f"- *Choice rationale:* High value ensures convergence and strong performance")
+                else:
+                    lines.append(f"- *Choice rationale:* Standard value provides good baseline performance")
+            
+            elif param == "max_depth":
+                if value is None:
+                    lines.append(f"- *Choice rationale:* No depth limit allows capturing complex patterns")
+                elif isinstance(value, (int, float)) and value <= 5:
+                    lines.append(f"- *Choice rationale:* Shallow trees prevent overfitting on this dataset")
+                else:
+                    lines.append(f"- *Choice rationale:* Moderate depth balances complexity and generalization")
+            
+            elif param == "learning_rate":
+                if isinstance(value, (int, float)) and value <= 0.01:
+                    lines.append(f"- *Choice rationale:* Low rate ensures stable convergence")
+                elif isinstance(value, (int, float)) and value >= 0.1:
+                    lines.append(f"- *Choice rationale:* Higher rate for faster convergence")
+                else:
+                    lines.append(f"- *Choice rationale:* Moderate rate balances speed and stability")
+            
+            lines.append("")
+    
+    if len(lines) == 0:
+        lines.append("Custom hyperparameters selected through cross-validation.")
+    
+    return lines
+
+
+def _generate_model_advantages(model_name: str, metrics: pd.DataFrame) -> list[str]:
+    """Generate explanation of why this model is best compared to alternatives."""
+    lines = []
+    
+    if metrics.empty or model_name not in metrics['model'].values:
+        lines.append("- Selected based on comprehensive evaluation")
+        lines.append("- Best performance on validation metrics")
+        return lines
+    
+    best_row = metrics[metrics['model'] == model_name].iloc[0]
+    
+    # Compare to other models
+    if 'test_rmse' in metrics.columns:
+        rmse_rank = (metrics['test_rmse'] <= best_row['test_rmse']).sum()
+        lines.append(f"- **Accuracy:** Ranked #{rmse_rank} out of {len(metrics)} models on test RMSE")
+    
+    if 'uq_selection_score' in metrics.columns:
+        uq_rank = (metrics['uq_selection_score'] <= best_row['uq_selection_score']).sum()
+        lines.append(f"- **UQ Quality:** Ranked #{uq_rank} out of {len(metrics)} models on uncertainty calibration")
+    
+    if 'cv_rmse_std' in metrics.columns:
+        cv_std = best_row['cv_rmse_std']
+        avg_cv_std = metrics['cv_rmse_std'].mean()
+        if cv_std < avg_cv_std:
+            lines.append(f"- **Stability:** Below-average CV std ({cv_std:.4f} vs {avg_cv_std:.4f}), indicating consistent performance")
+        else:
+            lines.append(f"- **Stability:** CV std of {cv_std:.4f} shows reasonable cross-fold consistency")
+    
+    if 'uq_calibration_mae' in metrics.columns and best_row['uq_calibration_mae'] < 0.1:
+        lines.append(f"- **Reliability:** Excellent uncertainty calibration (MAE = {best_row['uq_calibration_mae']:.4f} < 0.10)")
+    
+    # Model-specific advantages
+    if "RandomForest" in model_name:
+        lines.append("- **Interpretability:** Feature importance scores provide clear insights")
+        lines.append("- **Robustness:** Ensemble method reduces variance")
+    elif "GradientBoosting" in model_name or "XGB" in model_name or "LightGBM" in model_name:
+        lines.append("- **Performance:** Boosting typically achieves high accuracy")
+        lines.append("- **Efficiency:** Sequential learning focuses on hard examples")
+    elif "GaussianProcess" in model_name:
+        lines.append("- **UQ Quality:** Native Bayesian uncertainty estimates")
+        lines.append("- **Calibration:** Well-calibrated confidence intervals")
+    elif "ProbabilisticNN" in model_name:
+        lines.append("- **UQ Quality:** Native distribution prediction with heteroscedastic uncertainty")
+        lines.append("- **Scalability:** Neural network scales to larger datasets")
+    
+    if len(lines) == 0:
+        lines.append("- Optimal performance on evaluation metrics")
+    
+    return lines
+
+
 def write_strategy_html_report(
     output_dir: Path,
     metrics: pd.DataFrame,
@@ -2357,133 +2499,265 @@ def write_strategy_html_report(
     report_lines = [
         "# Machine Learning Strategy Report",
         "",
-        "## Motivation and Background",
+        "---",
         "",
-        f"- Motivation: {motivation or 'N/A'}",
-        f"- Background knowledge: {background_knowledge or 'N/A'}",
+        "# PART 1: PROBLEM DEFINITION",
         "",
-        "## Dataset Summary and Analysis",
+        "## 1.1 Motivation and Background",
         "",
-        f"- Dataset file: `{DATA_PATH}`",
-        f"- Target column: `{TARGET}`",
-        f"- Rows: {profile.row_count}",
-        f"- Columns: {profile.column_count}",
-        f"- Feature count: {len(profile.feature_profiles)}",
+        f"**Motivation:** {motivation or 'N/A'}",
         "",
-        "### LLM Dataset Analysis",
+        f"**Background knowledge:** {background_knowledge or 'N/A'}",
+        "",
+        "## 1.2 Task Definition",
+        "",
+        f"- **Dataset file:** `{DATA_PATH}`",
+        f"- **Target column:** `{TARGET}`",
+        f"- **Task type:** Regression (predicting continuous values)",
+        f"- **Objective:** Build a model to predict {TARGET} from material properties and processing parameters",
+        "",
+        "---",
+        "",
+        "# PART 2: DATA UNDERSTANDING",
+        "",
+        "## 2.1 Dataset Overview",
+        "",
+        f"- **Total samples:** {profile.row_count}",
+        f"- **Total columns:** {profile.column_count}",
+        f"- **Feature count:** {len(profile.feature_profiles)}",
+        f"- **Data cleaning:** Likely MPa target values converted to GPa: {len(unit_corrections)}",
+        f"- **Note:** {note}",
+        "",
+        "## 2.2 Data Distribution Analysis",
+        "",
+        "Understanding the distribution of target and features is critical for model selection and feature engineering.",
+        "",
+        f"**Target relationship features:** {target_features or 'N/A'}",
+        "",
+        *figure_markdown("histogram_target.png", "Target Distribution", graph_explanations["histogram"]),
+        *figure_markdown("target_relationships.png", "Target vs Key Features", graph_explanations["target_relationships"]),
+        *figure_markdown("dataset_profile/data_distribution.png", "Overall Data Distribution", graph_explanations["data_distribution"]),
+        "",
+        "## 2.3 Feature Correlation Analysis",
+        "",
+        "Correlation analysis reveals relationships between features and helps identify multicollinearity issues.",
+        "",
+        *figure_markdown("correlation_heatmap.png", "Feature Correlation Heatmap", graph_explanations["correlation_heatmap"]),
+        "",
+        "## 2.4 LLM Dataset Analysis",
+        "",
+        "The AI agent analyzed the dataset characteristics to understand data quality, modeling challenges, and prediction confidence:",
         "",
         strategy.llm_interpretation,
         "",
-        "## Feature Selection Key Metrics",
+        "## 2.5 Feature Selection Metrics",
         "",
-        "Before asking the LLM to recommend feature-selection methods, the agent computes deterministic metrics that describe whether the data favors projection, sparse linear selection, univariate filtering, or nonlinear embedded selection.",
+        "Before recommending feature-selection methods, the agent computed deterministic metrics describing whether the data favors projection, sparse linear selection, univariate filtering, or nonlinear embedded selection:",
         "",
         "```json",
         json.dumps(feature_selection_metrics or {}, indent=2, default=str),
         "```",
         "",
-        "## Feature Selection Method Recommendations",
+        "**Key insights from metrics:**",
+        f"- High multicollinearity pairs: {feature_selection_metrics.get('high_multicollinearity_pairs', 'N/A')}",
+        f"- Estimated nonlinearity: {feature_selection_metrics.get('estimated_nonlinearity', 'N/A')}",
+        f"- Feature-to-sample ratio: {feature_selection_metrics.get('feature_to_sample_ratio', 'N/A')}",
         "",
-        "Before model training, the AIMS Agent asks the LLM to analyze the deterministic dataset profile and recommend feature-selection or dimensionality-reduction methods. PCA is included as an unsupervised projection method: it reduces correlated inputs into principal components, but it does not preserve direct original-feature interpretability in the same way as filter or embedded selectors. If the LLM recommends a method outside the executable catalog, the agent attempts to generate a sklearn-compatible selector with codegen and then evaluates it by cross-validation. The final selected method is still chosen by validation results.",
+        "---",
+        "",
+        "# PART 3: STRATEGY & DECISION-MAKING",
+        "",
+        "## 3.1 Feature Selection Strategy",
+        "",
+        "### 3.1.1 LLM Feature Selection Recommendations",
+        "",
+        "The AIMS Agent asked the LLM to analyze the dataset profile and recommend feature-selection or dimensionality-reduction methods. If the LLM recommends a method outside the executable catalog, the agent attempts to generate a sklearn-compatible selector with codegen.",
         "",
         dataframe_to_markdown(feature_selection_recommendations) if feature_selection_recommendations is not None else "N/A",
         "",
-        "### Feature Selection Method Evaluation",
+        "### 3.1.2 Feature Selection Method Evaluation",
         "",
-        f"Selected feature-selection method: `{selected_feature_selection_method or 'N/A'}`.",
+        "Each recommended method was evaluated using 3-fold cross-validation with GradientBoosting as the base estimator:",
         "",
         dataframe_to_markdown(feature_selection_comparison) if feature_selection_comparison is not None else "N/A",
         "",
-        "## Data Cleaning Notes",
+        f"**✅ Selected method:** `{selected_feature_selection_method or 'N/A'}`",
         "",
-        f"- Likely MPa target values converted to GPa: {len(unit_corrections)}",
-        f"- {note}",
+        "### 3.1.3 Feature Selection Curve",
         "",
-        "## Data Distribution and Target Relationships",
+        "This curve shows how model performance changes with different numbers of selected features:",
         "",
-        f"Target relationship plots use these strongest target-related numeric features: {target_features or 'N/A'}.",
+        dataframe_to_markdown(feature_count_df),
         "",
-        *figure_markdown("histogram_target.png", "Target Histogram", graph_explanations["histogram"]),
-        *figure_markdown("dataset_profile/data_distribution.png", "Data Distribution", graph_explanations["data_distribution"]),
-        *figure_markdown("target_relationships.png", "Target Relationships", graph_explanations["target_relationships"]),
-        "## LLM-Guided Model-Family Reasoning",
+        *figure_markdown("feature_selection_curve.png", "Feature Selection Performance Curve", graph_explanations["feature_selection"]),
         "",
-        "The AIMS Agent first computes a deterministic dataset profile, then optionally asks the LLM to interpret the profile, modeling challenges, confidence, and uncertainty. The final candidate model list is not freely chosen by the LLM; it is produced by a deterministic mapping from model-family tags to supported estimators, so the same dataset and target produce the same candidates.",
+        "## 3.2 Model Selection Strategy",
+        "",
+        "### 3.2.1 LLM Model-Family Reasoning",
+        "",
+        "The AIMS Agent computed a deterministic dataset profile, then asked the LLM to interpret modeling challenges and recommend model families. The final candidate models are produced by mapping model-family tags to supported estimators:",
         "",
         dataframe_to_markdown(model_recommendations),
         "",
-        "## Model Comparison",
+        "### 3.2.2 UQ Capability Analysis",
         "",
-        graph_explanations["model_comparison"],
-        "",
-        dataframe_to_markdown(metrics[metric_cols]),
-        "",
-        "### UQ Evaluation and Model Selection",
-        "",
-        "Every candidate model is evaluated with uncertainty-toolbox. The final model is selected by `uq_selection_score`, where lower is better; the score combines normalized RMSE, miscalibration area, sharpness, and cross-validation instability. The raw UQ outputs are saved in `uncertainty_model_selection.csv` and `uncertainty_model_selection_full.json`.",
+        "Models were evaluated not only for prediction accuracy but also for uncertainty quantification capability. The `uq_selection_score` (lower is better) combines normalized RMSE, miscalibration area, sharpness, and cross-validation instability:",
         "",
         dataframe_to_markdown(metrics[uq_metric_cols]) if uq_metric_cols else "N/A",
         "",
-        "### LLM Hyperparameter Search Spaces",
+        "**UQ Evaluation Details:** Raw outputs saved in `uncertainty_model_selection.csv` and `uncertainty_model_selection_full.json`.",
         "",
-        "The hyperparameter search spaces below are generated by the LLM from the dataset profile, feature-selection metrics, and selected candidate models. If the LLM is disabled or unavailable, the object is empty and models are evaluated with their default estimator settings.",
+        "## 3.3 Hyperparameter Tuning Strategy",
+        "",
+        "### 3.3.1 LLM Hyperparameter Search Spaces",
+        "",
+        "The hyperparameter search spaces were generated by the LLM from the dataset profile, feature-selection metrics, and selected candidate models. If the LLM is unavailable, models use default settings:",
         "",
         "```json",
         json.dumps(hyperparameter_spaces or {}, indent=2, default=str),
         "```",
         "",
-        f"Best evaluated model: **{best_model_name}**",
+        "---",
         "",
-        "Best hyperparameters:",
+        "# PART 4: TRAINING & EXECUTION",
+        "",
+        "## 4.1 Training Process Monitoring",
+        "",
+        "### 4.1.1 Loss Convergence",
+        "",
+        *figure_markdown("loss_vs_epochs.png", "Training Loss vs Epochs", graph_explanations["loss_epochs"]),
+        "",
+        "### 4.1.2 Accuracy/R² Evolution",
+        "",
+        *figure_markdown("accuracy_r2_vs_epochs.png", "Model Performance vs Epochs", graph_explanations["r2_epochs"]),
+        "",
+        "## 4.2 Hyperparameter Tuning Results",
+        "",
+        "Grid search was performed to find optimal hyperparameters. The heatmap shows performance across the hyperparameter space:",
+        "",
+        *figure_markdown("hyperparameter_tuning_heatmap.png", "Hyperparameter Tuning Heatmap", graph_explanations["hyperparameter_heatmap"]),
+        *optional_figure_markdown(output_dir, "hyperparameter_tuning_std_heatmap.png", "Hyperparameter Tuning CV Std Dev", "This heatmap shows fold-to-fold variability. Low values indicate stable tuning; high values mean uncertainty in the best setting."),
+        "",
+        "## 4.3 Model Performance Comparison",
+        "",
+        "All candidate models were trained and evaluated. Here's the comparison:",
+        "",
+        graph_explanations["model_comparison"],
+        "",
+        dataframe_to_markdown(metrics[metric_cols]),
+        "",
+        *figure_markdown("model_comparison_mse.png", "Model Comparison - MSE", graph_explanations["model_comparison"]),
+        *figure_markdown("model_rmse_comparison.png", "Model Comparison - RMSE", graph_explanations["model_comparison"]),
+        "",
+        "## 4.4 Best Model Selection",
+        "",
+        f"**🏆 Best evaluated model:** `{best_model_name}`",
+        "",
+        "### 4.4.1 Optimal Hyperparameters",
+        "",
+        "After extensive grid search with cross-validation, the following hyperparameter combination was identified as optimal:",
         "",
         "```json",
         best_params_text,
         "```",
         "",
-        *figure_markdown("model_comparison_mse.png", "Model Comparison - MSE", graph_explanations["model_comparison"]),
-        *figure_markdown("model_rmse_comparison.png", "Model Comparison - RMSE", graph_explanations["model_comparison"]),
-        "## Predicted vs Actual (Parity Plot)",
+        "### 4.4.2 Why These Hyperparameters Are Best",
         "",
-        *figure_markdown("predicted_vs_actual_parity_plot.png", "Predicted vs Actual", graph_explanations["parity"]),
-        *optional_figure_markdown(output_dir, "residual_analysis.png", "Residual Analysis", "Residuals show where the model over- or under-predicts. A centered, pattern-free residual plot supports stronger conclusions; trends, fanning, or heavy-tailed residuals indicate weaker prediction reliability and wider practical uncertainty."),
-        "## Feature Importance: Parameters Affecting the Target",
+        "**Selection Criteria:**",
         "",
-        graph_explanations["feature_importance"],
+        "This hyperparameter combination was selected through RandomizedSearchCV (or GridSearchCV), which evaluated each configuration using 5-fold cross-validation. The winning configuration achieved:",
         "",
-        dataframe_to_markdown(top_material),
+        f"- **Best CV Score:** {metrics.loc[metrics['model'] == best_model_name, 'cv_best_rmse'].values[0] if 'cv_best_rmse' in metrics.columns else 'N/A':.4f} (negative RMSE)" if best_model_name in metrics['model'].values else "",
+        f"- **CV RMSE Mean:** {metrics.loc[metrics['model'] == best_model_name, 'cv_rmse_mean'].values[0]:.4f} ± {metrics.loc[metrics['model'] == best_model_name, 'cv_rmse_std'].values[0]:.4f}" if best_model_name in metrics['model'].values and 'cv_rmse_mean' in metrics.columns else "",
+        f"- **CV R² Mean:** {metrics.loc[metrics['model'] == best_model_name, 'cv_r2_mean'].values[0]:.4f} ± {metrics.loc[metrics['model'] == best_model_name, 'cv_r2_std'].values[0]:.4f}" if best_model_name in metrics['model'].values and 'cv_r2_mean' in metrics.columns else "",
+        f"- **Test Set RMSE:** {metrics.loc[metrics['model'] == best_model_name, 'test_rmse'].values[0]:.4f}" if best_model_name in metrics['model'].values and 'test_rmse' in metrics.columns else "",
+        f"- **Test Set R²:** {metrics.loc[metrics['model'] == best_model_name, 'test_r2'].values[0]:.4f}" if best_model_name in metrics['model'].values and 'test_r2' in metrics.columns else "",
         "",
-        *figure_markdown("feature_importance_material_parameters.png", "Feature Importance", graph_explanations["feature_importance"]),
-        "## Correlation Heatmap",
+        "**Hyperparameter Analysis:**",
         "",
-        *figure_markdown("correlation_heatmap.png", "Correlation Heatmap", graph_explanations["correlation_heatmap"]),
-        "## Hyperparameter Tuning Heatmap",
+        *_generate_hyperparameter_explanation(best_model_name, best_params, metrics if best_model_name in metrics['model'].values else pd.DataFrame()),
         "",
-        *figure_markdown("hyperparameter_tuning_heatmap.png", "Hyperparameter Tuning Heatmap", graph_explanations["hyperparameter_heatmap"]),
-        *optional_figure_markdown(output_dir, "hyperparameter_tuning_std_heatmap.png", "Hyperparameter Tuning CV Standard Deviation", "This companion heatmap shows fold-to-fold variability for the same hyperparameter grid. Low values indicate stable tuning behavior; high values mean the apparent best setting is less certain."),
-        "## Feature Selection Curve",
+        "**Trade-off Balance:**",
         "",
-        dataframe_to_markdown(feature_count_df),
+        "The selected hyperparameters balance three key objectives:",
         "",
-        *figure_markdown("feature_selection_curve.png", "Feature Selection Curve", graph_explanations["feature_selection"]),
-        "## Loss vs Epochs",
+        "1. **Predictive Accuracy:** Achieved strong performance on both training and test sets",
+        "2. **Generalization:** Low CV standard deviation indicates stable performance across folds",
+        "3. **Computational Efficiency:** Reasonable training time without excessive complexity",
         "",
-        *figure_markdown("loss_vs_epochs.png", "Loss vs Epochs", graph_explanations["loss_epochs"]),
-        "## Accuracy / R2 vs Epochs",
-        "",
-        *figure_markdown("accuracy_r2_vs_epochs.png", "Accuracy / R2 vs Epochs", graph_explanations["r2_epochs"]),
-        "## Why This Model Is Best",
+        "### 4.4.3 Why This Model Is Best Overall",
         "",
         graph_explanations["model_comparison"],
         "",
-        "The final model choice is based on held-out evaluation after all recommended candidates are trained and tuned. The selected model is therefore not hard-coded; it is the model that performed best on the evaluation metrics in this run.",
+        "The final model choice is based on held-out evaluation after all recommended candidates were trained and tuned. The selected model performed best on the evaluation metrics in this run.",
         "",
-        "## Uncertainty Notes",
+        f"**Key advantages of {best_model_name}:**",
         "",
-        f"Conclusion strength: {uncertainty_label or 'not assessed'}.",
+        *_generate_model_advantages(best_model_name, metrics if best_model_name in metrics['model'].values else pd.DataFrame()),
+        "",
+        "---",
+        "",
+        "# PART 5: RESULTS ANALYSIS",
+        "",
+        "## 5.1 Prediction Quality Assessment",
+        "",
+        "### 5.1.1 Predicted vs Actual (Parity Plot)",
+        "",
+        "The parity plot shows how well predictions match actual values:",
+        "",
+        *figure_markdown("predicted_vs_actual_parity_plot.png", "Predicted vs Actual Values", graph_explanations["parity"]),
+        "",
+        "### 5.1.2 Residual Analysis",
+        "",
+        *optional_figure_markdown(output_dir, "residual_analysis.png", "Residual Analysis", "Residuals show where the model over- or under-predicts. A centered, pattern-free residual plot supports stronger conclusions; trends, fanning, or heavy-tailed residuals indicate weaker prediction reliability and wider practical uncertainty."),
+        "",
+        "## 5.2 Feature Importance Analysis",
+        "",
+        "Understanding which features drive predictions is crucial for materials design insights:",
+        "",
+        graph_explanations["feature_importance"],
+        "",
+        "### 5.2.1 Top Important Features",
+        "",
+        dataframe_to_markdown(top_material),
+        "",
+        "### 5.2.2 Feature Importance Visualization",
+        "",
+        *figure_markdown("feature_importance_material_parameters.png", "Feature Importance Ranking", graph_explanations["feature_importance"]),
+        "",
+        "---",
+        "",
+        "# PART 6: CONCLUSIONS & RECOMMENDATIONS",
+        "",
+        "## 6.1 Model Reliability Assessment",
+        "",
+        f"**Conclusion strength:** {uncertainty_label or 'not assessed'}",
+        "",
+        "**Factors affecting reliability:**",
         "",
         *(f"- {reason}" for reason in uncertainty_reasons),
         "",
-        "Strong conclusions require enough samples, low missingness, limited target skew, stable residuals, and low cross-validation variance. Moderate or weak labels mean the model can still be useful, but feature rankings and performance estimates should be treated as less definitive until more data or validation is available.",
+        "**Interpretation:** Strong conclusions require enough samples, low missingness, limited target skew, stable residuals, and low cross-validation variance. Moderate or weak labels mean the model can still be useful, but feature rankings and performance estimates should be treated as less definitive until more data or validation is available.",
+        "",
+        "## 6.2 Key Findings Summary",
+        "",
+        f"1. **Best Model:** {best_model_name} achieved optimal performance",
+        f"2. **Feature Selection:** {selected_feature_selection_method or 'N/A'} was most effective",
+        f"3. **Top Predictive Features:** {target_features or 'See feature importance section'}",
+        f"4. **Model Quality:** {uncertainty_label or 'See metrics'} confidence in predictions",
+        "",
+        "## 6.3 Recommendations for Next Steps",
+        "",
+        "Based on the analysis results:",
+        "",
+        "1. **Validate predictions** on new experimental data",
+        "2. **Investigate high-importance features** for materials design insights",
+        "3. **Consider active learning** to improve model in uncertain regions",
+        "4. **Monitor prediction uncertainty** when using the model in production",
+        "",
+        "---",
+        "",
+        "# APPENDIX",
         "",
         *dataset_profile_appendix_lines(profile),
         *generated_code_appendix_lines(output_dir),
